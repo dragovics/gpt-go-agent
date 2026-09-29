@@ -54,6 +54,16 @@ func (c *Client) CreateSelfHostedSession(ctx context.Context, model, instruction
 
 func (c *Client) RetrieveSession(ctx context.Context,id string)(Session,error){var s Session;err:=c.do(ctx,http.MethodGet,"/v1/agents/sessions/"+id,nil,&s);return s,err}
 
+func (c *Client) WaitForSession(ctx context.Context,id string, interval time.Duration) (Session,error) {
+	if interval <= 0 { interval = 2*time.Second }
+	t := time.NewTicker(interval); defer t.Stop()
+	for {
+		s, err := c.RetrieveSession(ctx,id); if err != nil { return Session{},err }
+		if s.Environment.ID != "" && s.Environment.RemoteURL != "" { return s,nil }
+		select { case <-ctx.Done(): return Session{},ctx.Err(); case <-t.C: }
+	}
+}
+
 func (c *Client) SubmitInput(ctx context.Context,id,text string) error {
 	body:=map[string]any{"input":[]map[string]any{{"role":"user","content":[]map[string]any{{"type":"input_text","text":text}}}}}
 	return c.do(ctx,http.MethodPost,"/v1/agents/sessions/"+id+"/turns",body,nil)
