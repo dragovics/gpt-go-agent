@@ -13,6 +13,7 @@ import (
 type Client struct { BaseURL string; APIKey string; HTTP *http.Client }
 type Session struct {
 	ID string `json:"id"`
+	Status string `json:"status"`
 	Environment struct {
 		ID string `json:"id"`
 		RemoteURL string `json:"remote_url"`
