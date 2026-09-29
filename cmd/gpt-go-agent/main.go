@@ -15,6 +15,8 @@ import (
 	"github.com/dragovics/gpt-go-agent/internal/codex"
 	"github.com/dragovics/gpt-go-agent/internal/config"
 	"github.com/dragovics/gpt-go-agent/internal/server"
+	"github.com/dragovics/gpt-go-agent/internal/runtime"
+	"github.com/dragovics/gpt-go-agent/internal/webhook"
 	openaiagent "github.com/dragovics/gpt-go-agent/internal/openai"
 )
 
@@ -42,6 +44,23 @@ func main() {
 		_ = health.Shutdown(shutdownCtx)
 	}()
 
+	journal := webhook.NewJournal(os.Getenv("AGENT_WEBHOOK_JOURNAL"))
+	if os.Getenv("AGENT_WEBHOOK_JOURNAL") == "" { journal = webhook.NewJournal("agent-webhook.jsonl") }
+	queue := webhook.NewQueue(256, journal)
+	if err := queue.Recover(); err != nil { log.Printf("webhook recovery: %v", err) }
+	supervisor := codex.NewSupervisor(cfg.Workspace, nil)
+	worker := &webhook.Worker{Queue:queue, Reader:runtime.SessionReader{Client:client}, Supervisor:supervisor}
+	go worker.Run(ctx)
+	secret := os.Getenv("OPENAI_WEBHOOK_SECRET")
+	if secret != "" {
+		h := &webhook.Handler{Secret:secret, Queue:queue, Tolerance:5*time.Minute}
+		httpMux := server.New(a).Handler()
+		httpMux = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/webhooks/openai" { h.ServeHTTP(w,r); return }
+			server.New(a).Handler().ServeHTTP(w,r)
+		})
+		health.Handler = httpMux
+	}
 	client:=openaiagent.NewClient()
 	if *sessionID!="" {
 		if *input=="" { fmt.Fprintln(os.Stderr,"-input is required with -session"); os.Exit(2) }
