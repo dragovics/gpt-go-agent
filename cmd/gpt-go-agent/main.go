@@ -69,6 +69,13 @@ func main() {
 		_ = health.Shutdown(shutdownCtx)
 	}()
 
+	if *remote != "" || *envID != "" {
+		if *remote == "" || *envID == "" { log.Fatal("-remote and -environment-id must be provided together") }
+		if err := supervisor.Start(ctx, *envID, *remote); err != nil { log.Fatal(err) }
+		<-ctx.Done()
+		return
+	}
+
 	if *sessionID != "" {
 		if *input == "" { fmt.Fprintln(os.Stderr, "-input is required with -session"); os.Exit(2) }
 		if err := client.SubmitInput(ctx, *sessionID, *input); err != nil { log.Fatal(err) }
