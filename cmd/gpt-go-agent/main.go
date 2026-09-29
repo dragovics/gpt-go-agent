@@ -5,11 +5,16 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	"time"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/dragovics/gpt-go-agent/internal/agent"
 	"github.com/dragovics/gpt-go-agent/internal/codex"
+	"github.com/dragovics/gpt-go-agent/internal/config"
+	"github.com/dragovics/gpt-go-agent/internal/server"
 	openaiagent "github.com/dragovics/gpt-go-agent/internal/openai"
 )
 
@@ -24,6 +29,18 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	cfg := config.Default()
+	a := agent.New(cfg.Version)
+	health := &http.Server{Addr: cfg.ListenAddr, Handler: server.New(a).Handler()}
+	go func() {
+		if err := health.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Printf("health server: %v", err) }
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = health.Shutdown(shutdownCtx)
+	}()
 
 	client:=openaiagent.NewClient()
 	if *sessionID!="" {
