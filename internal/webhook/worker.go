@@ -35,7 +35,7 @@ func (w *Worker) Run(ctx context.Context) {
 		case <-ctx.Done(): return
 		case j := <-w.Queue.Next():
 			err := RetryLoop(ctx, func() error { return w.process(ctx, j) }, 3, 2*time.Second)
-			if err == nil { w.Queue.Complete(j) }
+			if err == nil { w.Queue.Complete(j) } else if ctx.Err() == nil { w.Queue.Dead(j, err) }
 		}
 	}
 }
