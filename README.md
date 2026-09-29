@@ -47,6 +47,26 @@ OpenAI's current self-hosted environment model uses `codex exec-server` as the e
 
 The App Server is a separate JSON-RPC integration and is currently documented as experimental. Keep that integration isolated so the project can adopt protocol changes without coupling the execution boundary to it.
 
+## Run the executor
+
+The environment key is intentionally supplied only through the process environment.
+
+```bash
+export CODEX_API_KEY='...restricted environment key...'
+export CODEX_REMOTE_URL='...session environment remote_url...'
+export CODEX_ENVIRONMENT_ID='...session environment id...'
+
+go run ./cmd/gpt-go-agent
+```
+
+The CLI starts:
+
+```text
+codex exec-server --remote "$CODEX_REMOTE_URL" --environment-id "$CODEX_ENVIRONMENT_ID"
+```
+
+The remote URL is passed unchanged. The application API key is not passed to the executor.
+
 ## Status
 
-Architecture foundations are in place. The next implementation layer is the authenticated session/event bridge and concrete environment provisioning, followed by integration tests.
+Architecture foundations and the local executor lifecycle are in place. The next layer is the authenticated session/event bridge and concrete environment provisioning, followed by integration tests and reconnect handling.
