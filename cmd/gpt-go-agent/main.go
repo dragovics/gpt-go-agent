@@ -32,14 +32,15 @@ func main() {
 		return
 	}
 
-	if *model=="" { *model="gpt-6-astra" }
+	if *model=="" { log.Fatal("CODEX_MODEL or -model is required") }
 	s,err:=client.CreateSelfHostedSession(ctx,*model,"Work in the provided environment and report concrete results.","/workspace",*input)
 	if err!=nil { log.Fatal(err) }
 	log.Printf("session=%s environment=%s",s.ID,s.Environment.ID)
 
 	if s.Environment.RemoteURL=="" || s.Environment.ID=="" { log.Fatal("session did not return self-hosted environment connection details") }
-	e:=codex.ExecServer(s.Environment.RemoteURL,s.Environment.ID,*workspace)
-	cmd,err:=e.Start(ctx); if err!=nil { log.Fatal(err) }
-	log.Printf("codex exec-server pid=%d",cmd.Process.Pid)
-	if err:=cmd.Wait(); err!=nil && ctx.Err()==nil { log.Fatal(err) }
+	if *workspace == "" { *workspace = "/workspace" }
+	supervisor := codex.NewSupervisor(*workspace, nil)
+	if err := supervisor.Start(ctx, s.Environment.ID, s.Environment.RemoteURL); err != nil { log.Fatal(err) }
+	<-ctx.Done()
+	supervisor.StopAll()
 }
