@@ -152,3 +152,59 @@ func TestLLMGatekeeper_Evaluate(t *testing.T) {
 		t.Errorf("destructive intent should be rejected: %+v", dec)
 	}
 }
+
+func TestLLMGatekeeperRetriesTransientFailures(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		dec, _ := json.Marshal(Decision{Approved: true, ExecType: "native", Command: "uptime"})
+		w.Header().Set("Content-Type", "application/json")
+		payload := map[string]any{"choices": []any{map[string]any{"message": map[string]string{"content": string(dec)}}}}
+		_ = json.NewEncoder(w).Encode(payload)
+	}))
+	defer ts.Close()
+	gk := New(Config{BaseURL: ts.URL, MaxAttempts: 3, RetryBaseDelay: time.Millisecond})
+	got, err := gk.Evaluate(context.Background(), "uptime", "")
+	if err != nil {
+		t.Fatalf("Evaluate error: %v", err)
+	}
+	if !got.Approved || calls != 3 {
+		t.Fatalf("decision=%+v calls=%d", got, calls)
+	}
+	m := gk.Metrics()
+	if m["middleman_retries_total"] != 2 {
+		t.Fatalf("retries=%d", m["middleman_retries_total"])
+	}
+}
+
+func TestLLMGatekeeperCircuitBreaker(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "down", http.StatusBadGateway)
+	}))
+	defer ts.Close()
+	gk := New(Config{BaseURL: ts.URL, MaxAttempts: 1, CircuitFailureThreshold: 2, CircuitOpenDuration: 30 * time.Millisecond})
+	for i := 0; i < 2; i++ {
+		if _, err := gk.Evaluate(context.Background(), "x", ""); err == nil {
+			t.Fatal("expected failure")
+		}
+	}
+	if _, err := gk.Evaluate(context.Background(), "x", ""); err == nil || !strings.Contains(err.Error(), "circuit breaker") {
+		t.Fatalf("expected open breaker, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("breaker did not stop request, calls=%d", calls)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if _, err := gk.Evaluate(context.Background(), "x", ""); err == nil {
+		t.Fatal("half-open request should still observe upstream failure")
+	}
+	if calls != 3 {
+		t.Fatalf("half-open call count=%d", calls)
+	}
+}

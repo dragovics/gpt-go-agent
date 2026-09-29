@@ -126,3 +126,39 @@ CI runs:
     go build ./...
 
 The goal is that all execution happens through the bounded MCP tool surface rather than through a second agent runtime embedded in this daemon.
+
+## Webhook execution pipeline
+
+The durable webhook path exposes:
+
+    POST /webhook
+    GET  /webhook?limit=50&offset=0
+    GET  /webhook/{id}
+
+Webhook POSTs require the configured bearer secret. `Idempotency-Key` prevents duplicate delivery from creating duplicate jobs; reusing a key with different request content returns HTTP 409. `X-Request-ID` can supply a correlation ID and is echoed in the response.
+
+The worker persists state transitions atomically, keeps a backup store, recovers pending jobs after restart, dead-letters terminal operational failures, retries transient Middleman failures with bounded backoff, and prunes terminal jobs after the configured retention period.
+
+Native execution has a deterministic allowlist. Codex execution is sandboxed to workspace-write, child environments are sanitized, and subprocess output is bounded.
+
+Metrics are exposed from `/metrics`, including queue depth, job lifecycle counts, retries, dead letters, execution latency, and Middleman retry/circuit statistics.
+
+## Resilience configuration
+
+    AGENT_MIDDLEMAN_MAX_ATTEMPTS
+    AGENT_MIDDLEMAN_RETRY_BASE
+    AGENT_MIDDLEMAN_CIRCUIT_THRESHOLD
+    AGENT_MIDDLEMAN_CIRCUIT_OPEN
+    AGENT_WEBHOOK_RETENTION
+    AGENT_WEBHOOK_CLEANUP_INTERVAL
+    AGENT_WEBHOOK_MAX_GATEKEEPER_RETRIES
+    AGENT_WEBHOOK_RETRY_BASE
+    AGENT_WEBHOOK_MAX_OUTPUT_BYTES
+
+See `deploy/env.example` for defaults.
+
+## Release and deployment
+
+Release tags use `vMAJOR.MINOR.PATCH`. The release workflow builds Linux amd64/arm64 artifacts and SHA256 checksums. `scripts/deploy.sh` performs an atomic binary replacement, restarts the service, verifies health/readiness, and restores the previous binary on failed deployment checks.
+
+The repository CI gate runs tests, race detection, vet, coverage, build, Staticcheck, Gosec, and govulncheck.

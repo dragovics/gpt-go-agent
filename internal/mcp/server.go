@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/dragovics/gpt-go-agent/internal/audit"
+	"github.com/dragovics/gpt-go-agent/internal/security"
 )
 
 const protocolVersion = "2025-06-18"
@@ -91,8 +93,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case "initialize":
 		writeRPC(w, req.ID, map[string]any{
 			"protocolVersion": protocolVersion,
-			"capabilities": map[string]any{"tools": map[string]any{}},
-			"serverInfo": map[string]any{"name": "gpt-go-agent", "version": "0.2.0"},
+			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"serverInfo":      map[string]any{"name": "gpt-go-agent", "version": "0.2.0"},
 		})
 	case "notifications/initialized":
 		w.WriteHeader(http.StatusAccepted)
@@ -219,11 +221,20 @@ func (s *Server) listDir(args map[string]any) (string, error) {
 }
 
 func (s *Server) readFile(args map[string]any) (string, error) {
-	p, err := s.resolve(stringArg(args, "path"))
+	rel := stringArg(args, "path")
+	if filepath.IsAbs(rel) {
+		return "", errors.New("absolute paths are not allowed")
+	}
+	clean := filepath.Clean(rel)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", errors.New("path escapes workspace")
+	}
+	root, err := os.OpenRoot(s.cfg.Workspace)
 	if err != nil {
 		return "", err
 	}
-	b, err := os.ReadFile(p)
+	defer root.Close()
+	b, err := fs.ReadFile(root.FS(), clean)
 	if err != nil {
 		return "", err
 	}
@@ -284,6 +295,7 @@ func (s *Server) execCommand(parent context.Context, args map[string]any) (strin
 	}
 	ctx, cancel := context.WithTimeout(parent, s.cfg.CommandTimeout)
 	defer cancel()
+	// #nosec G204 -- command is accepted only from the explicit server-side allowlist.
 	cmd := exec.CommandContext(ctx, command, argv...)
 	cmd.Dir = cwd
 	cmd.Env = s.safeEnv()
@@ -301,15 +313,7 @@ func (s *Server) execCommand(parent context.Context, args map[string]any) (strin
 }
 
 func (s *Server) safeEnv() []string {
-	blocked := map[string]bool{"OPENAI_API_KEY": true, "OPENAI_EXECUTOR_API_KEY": true, "OPENAI_WEBHOOK_SECRET": true, "AGENT_MCP_TOKEN": true}
-	var env []string
-	for _, item := range os.Environ() {
-		name, _, ok := strings.Cut(item, "=")
-		if ok && !blocked[name] {
-			env = append(env, item)
-		}
-	}
-	return env
+	return security.SanitizedEnvironment(os.Environ())
 }
 
 func stringArg(args map[string]any, key string) string {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -58,23 +59,46 @@ func main() {
 
 	// Initialize Middleman Gatekeeper (Satpam + Mandor)
 	gk := middleman.New(middleman.Config{
-		BaseURL: *middlemanURL,
-		APIKey:  *middlemanKey,
-		Model:   *middlemanModel,
-		Timeout: 30 * time.Second,
+		BaseURL:                 *middlemanURL,
+		APIKey:                  *middlemanKey,
+		Model:                   *middlemanModel,
+		Timeout:                 30 * time.Second,
+		MaxAttempts:             getenvInt("AGENT_MIDDLEMAN_MAX_ATTEMPTS", 3),
+		RetryBaseDelay:          getenvDuration("AGENT_MIDDLEMAN_RETRY_BASE", 250*time.Millisecond),
+		CircuitFailureThreshold: getenvInt("AGENT_MIDDLEMAN_CIRCUIT_THRESHOLD", 3),
+		CircuitOpenDuration:     getenvDuration("AGENT_MIDDLEMAN_CIRCUIT_OPEN", 10*time.Second),
 	})
 
-	// Initialize Webhook Worker with native execution + codex separation
+	// Initialize durable Webhook Worker with native execution + codex separation
 	executor := &webhook.DefaultExecutor{
-		Workspace: *workspace,
-		CodexBin:  *codexBin,
+		Workspace:      *workspace,
+		CodexBin:       *codexBin,
+		MaxOutputBytes: getenvInt("AGENT_WEBHOOK_MAX_OUTPUT_BYTES", 64*1024),
 	}
-	worker := webhook.NewWorker(gk, executor, webhook.Config{Workers: 4})
+	jobStorePath := getenv("AGENT_WEBHOOK_STORE", "/var/lib/gpt-go-agent/jobs/store.json")
+	jobStore := webhook.NewJobStore(jobStorePath)
+	webhookSecret := os.Getenv("OPENAI_WEBHOOK_SECRET")
+	if webhookSecret == "" {
+		log.Fatal("OPENAI_WEBHOOK_SECRET is required for webhook authentication")
+	}
+	worker := webhook.NewWorker(gk, executor, webhook.Config{
+		Workers:              4,
+		Store:                jobStore,
+		WebhookSecret:        webhookSecret,
+		RequireWebhookAuth:   true,
+		Retention:            getenvDuration("AGENT_WEBHOOK_RETENTION", 7*24*time.Hour),
+		CleanupInterval:      getenvDuration("AGENT_WEBHOOK_CLEANUP_INTERVAL", time.Hour),
+		MaxGatekeeperRetries: getenvInt("AGENT_WEBHOOK_MAX_GATEKEEPER_RETRIES", 2),
+		RetryBaseDelay:       getenvDuration("AGENT_WEBHOOK_RETRY_BASE", 500*time.Millisecond),
+		Auditor:              auditLog,
+		MaxOutputBytes:       getenvInt("AGENT_WEBHOOK_MAX_OUTPUT_BYTES", 64*1024),
+	})
 	defer worker.Close()
 
 	status := server.New(a)
+	status.Metrics = worker.Metrics
 	status.Ready = func() bool {
-		return *token != "" || strings.HasPrefix(*listen, "127.0.0.1:") || strings.HasPrefix(*listen, "localhost:") || strings.HasPrefix(*listen, "[::1]:")
+		return webhookSecret != "" && strings.TrimSpace(*middlemanURL) != "" && strings.TrimSpace(*middlemanModel) != ""
 	}
 
 	handler := http.NewServeMux()
@@ -84,8 +108,9 @@ func main() {
 	handler.Handle("/mcp", mcpServer.Handler())
 
 	// Mount Webhook Endpoints (POST /webhook, GET /webhook, GET /webhook/{id})
-	handler.Handle("/webhook", worker.Handler())
-	handler.Handle("/webhook/", worker.Handler())
+	webhookHandler := worker.Handler()
+	handler.Handle("/webhook", webhookHandler)
+	handler.Handle("/webhook/", webhookHandler)
 
 	srv := &http.Server{
 		Addr:              *listen,
@@ -97,8 +122,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("gpt-go-agent listening on %s workspace=%s write=%t exec=%t middleman=%s model=%s",
-			*listen, cfg.Workspace, *allowWrite, *allowExec, *middlemanURL, *middlemanModel)
+		log.Printf("gpt-go-agent started")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("server: %v", err)
 		}
@@ -115,4 +139,28 @@ func getenv(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getenvDuration(name string, fallback time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
+}
+
+func getenvInt(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
 }
