@@ -1,95 +1,128 @@
 # gpt-go-agent
 
-A lightweight execution boundary for ChatGPT/Codex-controlled remote development.
+A self-hosted execution gateway for ChatGPT-compatible MCP clients.
+
+The daemon does not run an LLM and does not depend on Codex quotas. It exposes a small, authenticated MCP tool surface that a connected ChatGPT/MCP client can call against a user-controlled workspace.
 
 ## Architecture
 
-```
-ChatGPT/Codex
-     |
-     | authenticated/official transport
-     v
-gpt-go-agent
-     |
-     +-- policy / audit / task lifecycle
-     +-- session / transport abstractions
-     +-- Codex executor integration
-     v
-user-controlled environment
-```
+    ChatGPT / MCP client
+            |
+            | Streamable HTTP / MCP
+            v
+      gpt-go-agent
+            |
+            +-- authentication
+            +-- workspace boundary
+            +-- write policy
+            +-- command allowlist
+            +-- audit log
+            |
+            v
+     user-controlled VPS/workspace
 
-The agent does not contain an LLM. It owns connection/session/policy concerns; Codex owns reasoning and the tool loop.
+The model/reasoning layer remains outside this process. gpt-go-agent is the execution boundary.
 
-## Implemented foundations
+## MCP endpoint
 
-1. Agent lifecycle and versioning
-2. Codex executor boundary
-3. Remote transport abstraction
-4. Persistent session state with crash-safe atomic storage
-5. Task lifecycle state
-6. Explicit tool contract
-7. Policy checks for writes/network
-8. JSONL audit logging
-9. Local health server, bound to `127.0.0.1:8787` by default
+The server exposes:
 
-## Security
+    POST /mcp
 
-- Localhost binding by default.
-- No public unauthenticated shell endpoint.
-- Writes and network access are policy-controlled.
-- Audit events are append-only JSONL with restrictive file permissions.
-- Credentials are not stored in source.
-- The Codex executor is an integration boundary; the agent does not implement a second shell protocol.
+It implements the MCP JSON-RPC methods needed for tool discovery and invocation:
 
-## Codex integration
+    initialize
+    notifications/initialized
+    tools/list
+    tools/call
 
-OpenAI's current self-hosted environment model uses `codex exec-server` as the executor. The executor connects outbound using a restricted environment key; application credentials stay outside the environment.
+Current tools:
 
-The App Server is a separate JSON-RPC integration and is currently documented as experimental. Keep that integration isolated so the project can adopt protocol changes without coupling the execution boundary to it.
+- list_dir
+- read_file
+- write_file
+- exec_command
 
-## Run the executor
+## Security model
 
-The environment key is intentionally supplied only through the process environment.
+- Workspace paths must remain inside the configured workspace.
+- Absolute paths are rejected.
+- Parent traversal outside the workspace is rejected.
+- Write access is disabled by default.
+- Command execution is disabled by default.
+- Executables must be explicitly allowlisted.
+- Command execution uses argument arrays, not a shell command string.
+- Command timeout and output size are bounded.
+- Remote MCP requests require a bearer token.
+- Without a token, MCP is accepted only from loopback.
+- The MCP token and OpenAI credentials are not inherited by child commands.
+- Tool calls are recorded in the append-only 0600 audit log.
+- The daemon does not expose an unauthenticated raw network shell.
 
-```bash
-export CODEX_API_KEY='...restricted environment key...'
-export CODEX_REMOTE_URL='...session environment remote_url...'
-export CODEX_ENVIRONMENT_ID='...session environment id...'
+## Configuration
 
-go run ./cmd/gpt-go-agent
-```
+See deploy/env.example.
 
-The CLI starts:
+Important settings:
 
-```text
-codex exec-server --remote "$CODEX_REMOTE_URL" --environment-id "$CODEX_ENVIRONMENT_ID"
-```
+    AGENT_MCP_TOKEN
+    AGENT_LISTEN_ADDR
+    AGENT_WORKSPACE
+    AGENT_ALLOW_WRITE
+    AGENT_ALLOW_COMMAND_EXEC
+    AGENT_ALLOWED_COMMANDS
+    AGENT_AUDIT_PATH
 
-The remote URL is passed unchanged. The application API key and webhook secret are explicitly stripped from the executor environment. The restricted executor key is exposed only as CODEX_API_KEY.
+Start locally:
 
-## Status
+    export AGENT_WORKSPACE=/var/lib/gpt-go-agent/workspace
+    export AGENT_MCP_TOKEN='use-a-long-random-secret'
+    go run ./cmd/gpt-go-agent
 
-Architecture foundations and the local executor lifecycle are in place. The production layer now includes webhook-driven reconnect, signed event verification, durable session state, bounded webhook deduplication, exponential lifecycle retries, readiness/metrics endpoints, executor secret isolation, and hardened systemd deployment.
+For command execution:
 
+    export AGENT_ALLOW_COMMAND_EXEC=1
+    export AGENT_ALLOWED_COMMANDS='git go python3 npm node make ls pwd cat grep find'
 
-## Production deployment
+Enable writes separately:
 
-The daemon exposes /healthz and, when OPENAI_WEBHOOK_SECRET is configured, /webhooks/openai.
-The webhook path verifies signatures before enqueueing work. Webhook jobs are journaled with mode 0600 and fsync, recovered at startup, deduplicated with bounded memory, retried with exponential backoff, and dead-lettered after the retry budget is exhausted.
+    export AGENT_ALLOW_WRITE=1
 
-Required application configuration is documented in deploy/env.example. Keep OPENAI_API_KEY outside the executor environment. Use a separate restricted environment key as CODEX_API_KEY for codex exec-server.
+Do not expose the service publicly without authentication and TLS/tunneling.
 
-A hardened systemd unit is provided at deploy/gpt-go-agent.service. Create a dedicated service account and writable state directory before enabling it.
+## Connecting to ChatGPT
 
-### Operational checks
+OpenAI documents custom MCP servers as a way for ChatGPT-compatible products to call tools on infrastructure you operate. ChatGPT connects to remote MCP servers; private/local servers can be reached through Secure MCP Tunnel rather than being exposed directly to the public internet.
 
-1. Install the approved Codex CLI on the execution host.
-2. Configure the application API key and webhook signing secret.
-3. Configure the restricted executor key only in the executor environment as CODEX_API_KEY.
-4. Start the daemon and verify /healthz.
-5. Create a self-hosted session and verify the executor reaches environment.connected.
-6. Exercise a harmless read-only task before enabling write/network capabilities.
-7. Verify journal and session recovery by restarting the daemon while a webhook job is queued or a session is active.
-8. Run go test ./..., go test -race ./..., go vet ./..., and go build ./... in CI before release.
+The exact availability of write-capable custom MCP apps depends on the ChatGPT product/workspace and its current developer-mode/app permissions.
 
-The application intentionally does not expose a raw network shell endpoint. The self-hosted executor remains the official OpenAI command bridge; this daemon does not proxy arbitrary shell requests. The executor remains the OpenAI-managed command bridge, while this daemon owns session lifecycle, authentication, queueing, policy, and audit boundaries.
+Recommended deployment path:
+
+    VPS
+      |
+      +-- gpt-go-agent
+      |
+      +-- private MCP endpoint
+              |
+              +-- Secure MCP Tunnel
+              |
+              +-- ChatGPT
+
+This keeps the execution service independent from Codex.
+
+## Operational hardening
+
+The systemd unit uses a dedicated service account and filesystem restrictions. Keep the workspace and audit/state directories under the service-owned data directory.
+
+Before enabling command execution, start with read-only tools and validate the MCP connection. Enable writes and command execution deliberately.
+
+## Tests
+
+CI runs:
+
+    go test ./...
+    go test -race ./...
+    go vet ./...
+    go build ./...
+
+The goal is that all execution happens through the bounded MCP tool surface rather than through a second agent runtime embedded in this daemon.
