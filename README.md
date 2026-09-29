@@ -70,3 +70,26 @@ The remote URL is passed unchanged. The application API key is not passed to the
 ## Status
 
 Architecture foundations and the local executor lifecycle are in place. The next production layer is webhook-driven provisioning/reconnect, signed event verification, durable task storage, observability, and end-to-end tests.
+
+
+## Production deployment
+
+The daemon exposes /healthz and, when OPENAI_WEBHOOK_SECRET is configured, /webhooks/openai.
+The webhook path verifies signatures before enqueueing work. Webhook jobs are journaled with mode 0600, recovered at startup, retried three times, and dead-lettered after the retry budget is exhausted.
+
+Required application configuration is documented in deploy/env.example. Keep OPENAI_API_KEY outside the executor environment. Use a separate restricted environment key as CODEX_API_KEY for codex exec-server.
+
+A hardened systemd unit is provided at deploy/gpt-go-agent.service. Create a dedicated service account and writable state directory before enabling it.
+
+### Operational checks
+
+1. Install the approved Codex CLI on the execution host.
+2. Configure the application API key and webhook signing secret.
+3. Configure the restricted executor key only in the executor environment as CODEX_API_KEY.
+4. Start the daemon and verify /healthz.
+5. Create a self-hosted session and verify the executor reaches environment.connected.
+6. Exercise a harmless read-only task before enabling write/network capabilities.
+7. Verify journal recovery by restarting the daemon while a webhook job is queued.
+8. Run go test ./..., go test -race ./..., go vet ./..., and go build ./... in CI before release.
+
+The application intentionally does not expose a raw network shell endpoint. The executor remains the OpenAI-managed command bridge, while this daemon owns session lifecycle, authentication, queueing, policy, and audit boundaries.
