@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"sync"
 	"time"
 )
