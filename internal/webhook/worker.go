@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -33,25 +34,24 @@ func (w *Worker) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done(): return
 		case j := <-w.Queue.Next():
-			w.process(ctx, j)
-			w.Queue.Complete(j)
+			err := RetryLoop(ctx, func() error { return w.process(ctx, j) }, 3, 2*time.Second)
+			if err == nil { w.Queue.Complete(j) }
 		}
 	}
 }
 
-func (w *Worker) process(ctx context.Context, j Job) {
-	if w.Reader == nil || w.Supervisor == nil { return }
+func (w *Worker) process(ctx context.Context, j Job) error {
+	if w.Reader == nil || w.Supervisor == nil { return fmt.Errorf("worker dependencies are not configured") }
 	s, err := w.Reader.GetSession(ctx, j.SessionID)
-	if err != nil { return }
+	if err != nil { return err }
 	if s.Failed || s.ID == "" {
 		if s.EnvironmentID != "" { w.Supervisor.Stop(s.EnvironmentID) }
-		return
+		return nil
 	}
-	if !s.RequiresConnection || s.EnvironmentID == "" || s.RemoteURL == "" { return }
-	_ = w.Supervisor.Start(ctx, s.EnvironmentID, s.RemoteURL)
+	if !s.RequiresConnection || s.EnvironmentID == "" || s.RemoteURL == "" { return nil }
+	return w.Supervisor.Start(ctx, s.EnvironmentID, s.RemoteURL)
 }
 
-// RetryLoop is intentionally small; the API remains the source of truth.
 func RetryLoop(ctx context.Context, fn func() error, attempts int, delay time.Duration) error {
 	var err error
 	for i:=0; i<attempts; i++ {
