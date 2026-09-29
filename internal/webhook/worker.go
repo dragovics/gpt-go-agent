@@ -60,12 +60,19 @@ func (w *Worker) process(ctx context.Context, j Job) error {
 		if s.EnvironmentID != "" {
 			w.Supervisor.Stop(s.EnvironmentID)
 		}
+		if w.Sessions != nil && s.ID != "" {
+			if err := w.Sessions.Put(s.ID, s.EnvironmentID, s.RemoteURL, "failed"); err != nil { return err }
+		}
 		return nil
 	}
 	if !s.RequiresConnection || s.EnvironmentID == "" || s.RemoteURL == "" {
 		return nil
 	}
-	return w.Supervisor.Start(ctx, s.EnvironmentID, s.RemoteURL)
+	if err := w.Supervisor.Start(ctx, s.EnvironmentID, s.RemoteURL); err != nil { return err }
+	if w.Sessions != nil {
+		if err := w.Sessions.Put(s.ID, s.EnvironmentID, s.RemoteURL, "active"); err != nil { return err }
+	}
+	return nil
 }
 
 // RetryLoop retries with exponential backoff. It intentionally does not
