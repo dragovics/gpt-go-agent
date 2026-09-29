@@ -48,7 +48,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(body, &e); err != nil {
 		http.Error(w, "invalid event", http.StatusBadRequest); return
 	}
-	if e.Type != "agent.session.action_required" && e.Type != "agent.session.failed" {
+	if e.Type != "agent.session.created" && e.Type != "agent.session.action_required" && e.Type != "agent.session.failed" {
 		w.WriteHeader(http.StatusOK); return
 	}
 	if e.Type == "agent.session.action_required" && e.Data.RequiredAction.Type != "environment_connection" {
