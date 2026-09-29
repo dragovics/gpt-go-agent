@@ -12,11 +12,14 @@ import (
 
 type Client struct { BaseURL string; APIKey string; HTTP *http.Client }
 type Session struct {
-	ID string `json:"id"
+	ID string `json:"id"`
 	Environment struct {
-		ID string `json:"id"
-		RemoteURL string `json:"remote_url"
-	} `json:"environment"
+		ID string `json:"id"`
+		RemoteURL string `json:"remote_url"`
+	} `json:"environment"`
+	RequiredActions []struct {
+		Type string `json:"type"`
+	} `json:"required_actions"`
 }
 
 func NewClient() *Client {
