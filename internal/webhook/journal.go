@@ -27,9 +27,8 @@ func (j *Journal) append(r journalRecord) error {
 	if err != nil { return err }
 	defer f.Close()
 	b, err := json.Marshal(r); if err != nil { return err }
-	_, err = f.Write(append(b,'
-'))
-	return err
+	if _, err = f.Write(append(b, '\n')); err != nil { return err }
+	return f.Sync()
 }
 
 func (j *Journal) Enqueue(job Job) error { return j.append(journalRecord{Job:job}) }
