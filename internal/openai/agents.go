@@ -23,7 +23,7 @@ type Session struct {
 }
 
 func NewClient() *Client {
-	return &Client{BaseURL:"https://api.openai.com", APIKey:os.Getenv("OPENAI_API_KEY"), HTTP:&http.Client{Timeout:60*time.Second}}
+	return &Client{BaseURL:"https://api.openai.com", APIKey:os.Getenv("OPENAI_API_KEY"), HTTP:&http.Client{Timeout:6*time.Minute}}
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
