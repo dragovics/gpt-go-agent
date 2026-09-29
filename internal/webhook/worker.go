@@ -34,6 +34,7 @@ func (w *Worker) Run(ctx context.Context) {
 		case <-ctx.Done(): return
 		case j := <-w.Queue.Next():
 			w.process(ctx, j)
+			w.Queue.Complete(j)
 		}
 	}
 }
