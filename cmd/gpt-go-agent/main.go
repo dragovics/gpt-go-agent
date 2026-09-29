@@ -10,33 +10,36 @@ import (
 	"syscall"
 
 	"github.com/dragovics/gpt-go-agent/internal/codex"
+	openaiagent "github.com/dragovics/gpt-go-agent/internal/openai"
 )
 
 func main() {
 	remote := flag.String("remote", os.Getenv("CODEX_REMOTE_URL"), "Codex environment remote URL")
 	envID := flag.String("environment-id", os.Getenv("CODEX_ENVIRONMENT_ID"), "Codex environment ID")
-	workspace := flag.String("workspace", os.Getenv("CODEX_WORKSPACE"), "optional workspace label")
+	workspace := flag.String("workspace", os.Getenv("CODEX_WORKSPACE"), "workspace")
+	model := flag.String("model", os.Getenv("CODEX_MODEL"), "Agents API model")
+	sessionID := flag.String("session", os.Getenv("AGENT_SESSION_ID"), "existing Agents API session")
+	input := flag.String("input", "", "submit input to an existing session")
 	flag.Parse()
-
-	if *remote == "" || *envID == "" {
-		fmt.Fprintln(os.Stderr, "missing CODEX_REMOTE_URL or CODEX_ENVIRONMENT_ID")
-		os.Exit(2)
-	}
-	if os.Getenv("CODEX_API_KEY") == "" {
-		fmt.Fprintln(os.Stderr, "missing CODEX_API_KEY")
-		os.Exit(2)
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	e := codex.ExecServer(*remote, *envID, *workspace)
-	cmd, err := e.Start(ctx)
-	if err != nil {
-		log.Fatal(err)
+	client:=openaiagent.NewClient()
+	if *sessionID!="" {
+		if *input=="" { fmt.Fprintln(os.Stderr,"-input is required with -session"); os.Exit(2) }
+		if err:=client.SubmitInput(ctx,*sessionID,*input); err!=nil { log.Fatal(err) }
+		return
 	}
-	log.Printf("codex exec-server started (pid=%d)", cmd.Process.Pid)
-	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-		log.Fatal(err)
-	}
+
+	if *model=="" { *model="gpt-6-astra" }
+	s,err:=client.CreateSelfHostedSession(ctx,*model,"Work in the provided environment and report concrete results.","/workspace",*input)
+	if err!=nil { log.Fatal(err) }
+	log.Printf("session=%s environment=%s",s.ID,s.Environment.ID)
+
+	if s.Environment.RemoteURL=="" || s.Environment.ID=="" { log.Fatal("session did not return self-hosted environment connection details") }
+	e:=codex.ExecServer(s.Environment.RemoteURL,s.Environment.ID,*workspace)
+	cmd,err:=e.Start(ctx); if err!=nil { log.Fatal(err) }
+	log.Printf("codex exec-server pid=%d",cmd.Process.Pid)
+	if err:=cmd.Wait(); err!=nil && ctx.Err()==nil { log.Fatal(err) }
 }
