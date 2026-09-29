@@ -1,24 +1,42 @@
 package main
 
 import (
+	"context"
+	"flag"
+	"fmt"
 	"log"
-	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 
-	"github.com/dragovics/gpt-go-agent/internal/agent"
-	"github.com/dragovics/gpt-go-agent/internal/config"
-	"github.com/dragovics/gpt-go-agent/internal/server"
+	"github.com/dragovics/gpt-go-agent/internal/codex"
 )
 
 func main() {
-	cfg := config.Default()
-	if v := os.Getenv("GPT_GO_AGENT_VERSION"); v != "" {
-		cfg.Version = v
+	remote := flag.String("remote", os.Getenv("CODEX_REMOTE_URL"), "Codex environment remote URL")
+	envID := flag.String("environment-id", os.Getenv("CODEX_ENVIRONMENT_ID"), "Codex environment ID")
+	workspace := flag.String("workspace", os.Getenv("CODEX_WORKSPACE"), "optional workspace label")
+	flag.Parse()
+
+	if *remote == "" || *envID == "" {
+		fmt.Fprintln(os.Stderr, "missing CODEX_REMOTE_URL or CODEX_ENVIRONMENT_ID")
+		os.Exit(2)
 	}
-	a := agent.New(cfg.Version)
-	s := server.New(a)
-	log.Printf("gpt-go-agent %s listening on %s", cfg.Version, cfg.ListenAddr)
-	if err := http.ListenAndServe(cfg.ListenAddr, s.Handler()); err != nil {
+	if os.Getenv("CODEX_API_KEY") == "" {
+		fmt.Fprintln(os.Stderr, "missing CODEX_API_KEY")
+		os.Exit(2)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	e := codex.ExecServer(*remote, *envID, *workspace)
+	cmd, err := e.Start(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("codex exec-server started (pid=%d)", cmd.Process.Pid)
+	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
 		log.Fatal(err)
 	}
 }
