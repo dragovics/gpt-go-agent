@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"time"
 )
@@ -35,15 +36,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	var body []byte
-	if r.ContentLength >= 0 && r.ContentLength <= 2<<20 {
-		body = make([]byte, r.ContentLength)
-		if _, err := r.Body.Read(body); err != nil {
-			http.Error(w, "invalid body", http.StatusBadRequest); return
-		}
-	} else {
-		http.Error(w, "invalid body", http.StatusRequestEntityTooLarge); return
-	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20+1))
+	if err != nil { http.Error(w, "invalid body", http.StatusBadRequest); return }
+	if len(body) > 2<<20 { http.Error(w, "body too large", http.StatusRequestEntityTooLarge); return }
 	now := time.Now()
 	if h.Now != nil { now = h.Now() }
 	if err := Verify(h.Secret, r.Header.Get("webhook-id"), r.Header.Get("webhook-timestamp"), r.Header.Get("webhook-signature"), body, now, h.Tolerance); err != nil {
