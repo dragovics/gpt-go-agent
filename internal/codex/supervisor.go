@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 type Factory func(remoteURL, environmentID, workspace string) *Executor
@@ -13,6 +14,8 @@ type Supervisor struct {
 	running map[string]*execHandle
 	factory Factory
 	workspace string
+	restartDelay time.Duration
+	maxRestarts int
 }
 
 type execHandle struct {
@@ -22,7 +25,7 @@ type execHandle struct {
 
 func NewSupervisor(workspace string, factory Factory) *Supervisor {
 	if factory == nil { factory = ExecServer }
-	return &Supervisor{running: make(map[string]*execHandle), factory: factory, workspace: workspace}
+	return &Supervisor{running: make(map[string]*execHandle), factory: factory, workspace: workspace, restartDelay: 2*time.Second, maxRestarts: 3}
 }
 
 func (s *Supervisor) Start(ctx context.Context, environmentID, remoteURL string) error {
