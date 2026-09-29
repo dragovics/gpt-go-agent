@@ -25,7 +25,7 @@ The agent does not contain an LLM. It owns connection/session/policy concerns; C
 1. Agent lifecycle and versioning
 2. Codex executor boundary
 3. Remote transport abstraction
-4. Persistent-in-process session state
+4. Persistent session state with crash-safe atomic storage
 5. Task lifecycle state
 6. Explicit tool contract
 7. Policy checks for writes/network
@@ -65,17 +65,17 @@ The CLI starts:
 codex exec-server --remote "$CODEX_REMOTE_URL" --environment-id "$CODEX_ENVIRONMENT_ID"
 ```
 
-The remote URL is passed unchanged. The application API key is not passed to the executor.
+The remote URL is passed unchanged. The application API key and webhook secret are explicitly stripped from the executor environment. The restricted executor key is exposed only as CODEX_API_KEY.
 
 ## Status
 
-Architecture foundations and the local executor lifecycle are in place. The next production layer is webhook-driven provisioning/reconnect, signed event verification, durable task storage, observability, and end-to-end tests.
+Architecture foundations and the local executor lifecycle are in place. The production layer now includes webhook-driven reconnect, signed event verification, durable session state, bounded webhook deduplication, exponential lifecycle retries, readiness/metrics endpoints, executor secret isolation, and hardened systemd deployment.
 
 
 ## Production deployment
 
 The daemon exposes /healthz and, when OPENAI_WEBHOOK_SECRET is configured, /webhooks/openai.
-The webhook path verifies signatures before enqueueing work. Webhook jobs are journaled with mode 0600, recovered at startup, retried three times, and dead-lettered after the retry budget is exhausted.
+The webhook path verifies signatures before enqueueing work. Webhook jobs are journaled with mode 0600 and fsync, recovered at startup, deduplicated with bounded memory, retried with exponential backoff, and dead-lettered after the retry budget is exhausted.
 
 Required application configuration is documented in deploy/env.example. Keep OPENAI_API_KEY outside the executor environment. Use a separate restricted environment key as CODEX_API_KEY for codex exec-server.
 
@@ -89,7 +89,7 @@ A hardened systemd unit is provided at deploy/gpt-go-agent.service. Create a ded
 4. Start the daemon and verify /healthz.
 5. Create a self-hosted session and verify the executor reaches environment.connected.
 6. Exercise a harmless read-only task before enabling write/network capabilities.
-7. Verify journal recovery by restarting the daemon while a webhook job is queued.
+7. Verify journal and session recovery by restarting the daemon while a webhook job is queued or a session is active.
 8. Run go test ./..., go test -race ./..., go vet ./..., and go build ./... in CI before release.
 
-The application intentionally does not expose a raw network shell endpoint. The executor remains the OpenAI-managed command bridge, while this daemon owns session lifecycle, authentication, queueing, policy, and audit boundaries.
+The application intentionally does not expose a raw network shell endpoint. The self-hosted executor remains the official OpenAI command bridge; this daemon does not proxy arbitrary shell requests. The executor remains the OpenAI-managed command bridge, while this daemon owns session lifecycle, authentication, queueing, policy, and audit boundaries.
