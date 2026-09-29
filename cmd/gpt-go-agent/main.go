@@ -178,7 +178,11 @@ func main() {
 	}
 
 	if s.Environment.RemoteURL == "" || s.Environment.ID == "" {
-		log.Fatal("session did not return self-hosted environment connection details")
+		s, err = client.WaitForSession(ctx, s.ID, 2*time.Second)
+		if err != nil { log.Fatal(err) }
+	}
+	if s.Environment.RemoteURL == "" || s.Environment.ID == "" {
+		log.Fatal("session did not provide self-hosted environment connection details")
 	}
 	if err := supervisor.Start(ctx, s.Environment.ID, s.Environment.RemoteURL); err != nil {
 		log.Fatal(err)
