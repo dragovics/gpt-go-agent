@@ -10,7 +10,7 @@ import (
 )
 
 func TestVerify(t *testing.T) {
-	raw := []byte("{"type":"agent.session.action_required"}")
+	raw := []byte(` + "`" + `{"type":"agent.session.action_required"}` + "`" + `)
 	secret := "whsec_" + base64.StdEncoding.EncodeToString([]byte("test-secret"))
 	id := "evt_123"
 	ts := time.Now().Unix()
