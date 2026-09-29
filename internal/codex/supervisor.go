@@ -48,6 +48,9 @@ func (s *Supervisor) Start(ctx context.Context, environmentID, remoteURL string)
 		if !ok || cur != h || runCtx.Err() != nil { return }
 		for attempt := 1; attempt <= s.maxRestarts; attempt++ {
 			select { case <-runCtx.Done(): return; case <-time.After(s.restartDelay): }
+			s.mu.Lock()
+			if cur, ok := s.running[environmentID]; ok && cur == h { delete(s.running, environmentID) }
+			s.mu.Unlock()
 			if err := s.Start(runCtx, environmentID, remoteURL); err == nil { return }
 		}
 		s.mu.Lock()
