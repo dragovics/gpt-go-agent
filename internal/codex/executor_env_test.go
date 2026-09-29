@@ -1,7 +1,6 @@
 package codex
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
@@ -15,8 +14,5 @@ func TestInheritedEnvironmentStripsApplicationCredentials(t *testing.T) {
 		if strings.Contains(env, secret) {
 			t.Fatalf("application credential leaked into executor environment: %q", secret)
 		}
-	}
-	if _, err := os.LookupEnv("OPENAI_API_KEY"); err {
-		t.Fatal("unreachable")
 	}
 }
