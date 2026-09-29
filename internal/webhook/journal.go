@@ -15,6 +15,8 @@ type Journal struct {
 type journalRecord struct {
 	Job Job `json:"job"`
 	Done bool `json:"done"`
+	Dead bool `json:"dead"`
+	Error string `json:"error,omitempty"`
 }
 
 func NewJournal(path string) *Journal { return &Journal{path:path} }
@@ -32,6 +34,7 @@ func (j *Journal) append(r journalRecord) error {
 
 func (j *Journal) Enqueue(job Job) error { return j.append(journalRecord{Job:job}) }
 func (j *Journal) Done(job Job) error { return j.append(journalRecord{Job:job, Done:true}) }
+func (j *Journal) Dead(job Job, err error) error { msg := ""; if err != nil { msg = err.Error() }; return j.append(journalRecord{Job:job, Dead:true, Error:msg}) }
 
 func (j *Journal) Pending() ([]Job,error) {
 	f, err := os.Open(j.path)
@@ -44,7 +47,7 @@ func (j *Journal) Pending() ([]Job,error) {
 	for s.Scan() {
 		var r journalRecord
 		if json.Unmarshal(s.Bytes(), &r) != nil || r.Job.ID == "" { continue }
-		if r.Done { done[r.Job.ID]=true; delete(pending,r.Job.ID) } else if !done[r.Job.ID] { pending[r.Job.ID]=r.Job }
+		if r.Done || r.Dead { done[r.Job.ID]=true; delete(pending,r.Job.ID) } else if !done[r.Job.ID] { pending[r.Job.ID]=r.Job }
 	}
 	if err:=s.Err(); err!=nil{return nil,err}
 	out:=make([]Job,0,len(pending)); for _,v:=range pending { out=append(out,v) }
