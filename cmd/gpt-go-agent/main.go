@@ -3,189 +3,71 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/dragovics/gpt-go-agent/internal/agent"
-	"github.com/dragovics/gpt-go-agent/internal/codex"
+	"github.com/dragovics/gpt-go-agent/internal/audit"
 	"github.com/dragovics/gpt-go-agent/internal/config"
-	openaiagent "github.com/dragovics/gpt-go-agent/internal/openai"
-	"github.com/dragovics/gpt-go-agent/internal/runtime"
+	"github.com/dragovics/gpt-go-agent/internal/mcp"
 	"github.com/dragovics/gpt-go-agent/internal/server"
-	"github.com/dragovics/gpt-go-agent/internal/session"
-	"github.com/dragovics/gpt-go-agent/internal/webhook"
 )
 
-type lifecycleStore struct {
-	store *session.DurableStore
-}
-
-func (s lifecycleStore) Put(id, environmentID, remoteURL, state string) error {
-	return s.store.Put(session.Session{
-		ID:            id,
-		EnvironmentID: environmentID,
-		RemoteURL:     remoteURL,
-		State:         session.State(state),
-	})
-}
-
 func main() {
-	remote := flag.String("remote", os.Getenv("CODEX_REMOTE_URL"), "Codex environment remote URL")
-	envID := flag.String("environment-id", os.Getenv("CODEX_ENVIRONMENT_ID"), "Codex environment ID")
-	workspace := flag.String("workspace", os.Getenv("CODEX_WORKSPACE"), "workspace")
-	model := flag.String("model", os.Getenv("CODEX_MODEL"), "Agents API model")
-	sessionID := flag.String("session", os.Getenv("AGENT_SESSION_ID"), "existing Agents API session")
-	input := flag.String("input", "", "submit input to an existing session")
+	listen := flag.String("listen", getenv("AGENT_LISTEN_ADDR", "127.0.0.1:8787"), "HTTP listen address")
+	workspace := flag.String("workspace", getenv("AGENT_WORKSPACE", "."), "execution workspace")
+	token := flag.String("token", os.Getenv("AGENT_MCP_TOKEN"), "MCP bearer token")
+	allowWrite := flag.Bool("allow-write", os.Getenv("AGENT_ALLOW_WRITE") == "1", "enable workspace writes")
+	allowExec := flag.Bool("allow-command-exec", os.Getenv("AGENT_ALLOW_COMMAND_EXEC") == "1", "enable allowlisted command execution")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	cfg := config.Default()
-	if *workspace != "" {
-		cfg.Workspace = *workspace
-	}
+	cfg.Workspace = *workspace
 
-	client := openaiagent.NewClient()
 	a := agent.New(cfg.Version)
+	auditPath := getenv("AGENT_AUDIT_PATH", cfg.AuditPath)
+	auditLog := audit.New(auditPath)
 
-	journalPath := os.Getenv("AGENT_WEBHOOK_JOURNAL")
-	if journalPath == "" {
-		journalPath = "agent-webhook.jsonl"
-	}
-	journal := webhook.NewJournal(journalPath)
-	queue := webhook.NewQueue(256, journal)
-	if err := queue.Recover(); err != nil {
-		log.Printf("webhook recovery: %v", err)
-	}
-
-	sessionPath := os.Getenv("AGENT_SESSION_STORE")
-	if sessionPath == "" {
-		sessionPath = "agent-sessions.json"
-	}
-	sessionStore := session.NewDurableStore(sessionPath)
-	if err := sessionStore.Load(); err != nil {
-		log.Printf("session recovery: %v", err)
-	}
-
-	supervisor := codex.NewSupervisor(cfg.Workspace, nil)
-	worker := &webhook.Worker{
-		Queue:      queue,
-		Reader:     runtime.SessionReader{Client: client},
-		Supervisor: supervisor,
-		Sessions:   lifecycleStore{store: sessionStore},
-	}
-	go worker.Run(ctx)
+	mcpServer, err := mcp.New(mcp.Config{
+		Workspace: *workspace,
+		Token: *token,
+		AllowWrite: *allowWrite,
+		AllowCommandExec: *allowExec,
+		CommandTimeout: cfg.CommandTimeout,
+		MaxOutputBytes: cfg.MaxOutputBytes,
+	}, auditLog)
+	if err != nil { log.Fatal(err) }
 
 	status := server.New(a)
-	status.Metrics = func() map[string]int64 {
-		return map[string]int64{
-			"queue_depth":       int64(queue.Len()),
-			"executors_active":  int64(supervisor.Active()),
-			"journal_recovery":  int64(0),
-		}
-	}
+	status.Ready = func() bool { return *token != "" || strings.HasPrefix(*listen, "127.0.0.1:") || strings.HasPrefix(*listen, "localhost:") || strings.HasPrefix(*listen, "[::1]:") }
+	handler := http.NewServeMux()
+	handler.Handle("/healthz", status.Handler())
+	handler.Handle("/readyz", status.Handler())
+	handler.Handle("/metrics", status.Handler())
+	handler.Handle("/mcp", mcpServer.Handler())
 
-	handler := status.Handler()
-	if secret := os.Getenv("OPENAI_WEBHOOK_SECRET"); secret != "" {
-		webhookHandler := &webhook.Handler{
-			Secret:    secret,
-			Queue:     queue,
-			Tolerance: 5 * time.Minute,
-		}
-		mux := http.NewServeMux()
-		mux.Handle("/healthz", handler)
-		mux.Handle("/readyz", handler)
-		mux.Handle("/metrics", handler)
-		mux.Handle("/webhooks/openai", webhookHandler)
-		handler = mux
-	} else {
-		log.Printf("OPENAI_WEBHOOK_SECRET is not set; webhook endpoint disabled")
-	}
+	srv := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 2 * time.Minute, IdleTimeout: 2 * time.Minute}
 
-	health := &http.Server{Addr: cfg.ListenAddr, Handler: handler}
 	go func() {
-		if err := health.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("health server: %v", err)
-		}
-	}()
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		supervisor.StopAll()
-		_ = health.Shutdown(shutdownCtx)
+		log.Printf("gpt-go-agent listening on %s workspace=%s write=%t exec=%t", *listen, cfg.Workspace, *allowWrite, *allowExec)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Printf("server: %v", err) }
 	}()
 
-	if *remote != "" || *envID != "" {
-		if *remote == "" || *envID == "" {
-			log.Fatal("-remote and -environment-id must be provided together")
-		}
-		if err := sessionStore.Put(session.Session{
-			ID:            "direct:" + *envID,
-			EnvironmentID: *envID,
-			RemoteURL:     *remote,
-			State:         session.Active,
-		}); err != nil {
-			log.Printf("persist direct environment: %v", err)
-		}
-		if err := supervisor.Start(ctx, *envID, *remote); err != nil {
-			log.Fatal(err)
-		}
-		<-ctx.Done()
-		return
-	}
-
-	if *sessionID != "" {
-		if *input == "" {
-			fmt.Fprintln(os.Stderr, "-input is required with -session")
-			os.Exit(2)
-		}
-		if err := client.SubmitInput(ctx, *sessionID, *input); err != nil {
-			log.Fatal(err)
-		}
-		<-ctx.Done()
-		return
-	}
-
-	if *model == "" {
-		log.Fatal("CODEX_MODEL or -model is required")
-	}
-
-	s, err := client.CreateSelfHostedSession(
-		ctx,
-		*model,
-		"Work in the provided environment and report concrete results.",
-		cfg.Workspace,
-		*input,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("session=%s environment=%s", s.ID, s.Environment.ID)
-
-	if err := sessionStore.Put(session.Session{
-		ID:            s.ID,
-		EnvironmentID: s.Environment.ID,
-		RemoteURL:     s.Environment.RemoteURL,
-		State:         session.Pending,
-	}); err != nil {
-		log.Printf("persist session: %v", err)
-	}
-
-	if s.Environment.RemoteURL == "" || s.Environment.ID == "" {
-		s, err = client.WaitForSession(ctx, s.ID, 2*time.Second)
-		if err != nil { log.Fatal(err) }
-	}
-	if s.Environment.RemoteURL == "" || s.Environment.ID == "" {
-		log.Fatal("session did not provide self-hosted environment connection details")
-	}
-	if err := supervisor.Start(ctx, s.Environment.ID, s.Environment.RemoteURL); err != nil {
-		log.Fatal(err)
-	}
 	<-ctx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(shutdownCtx)
+}
+
+func getenv(name, fallback string) string {
+	if v := os.Getenv(name); v != "" { return v }
+	return fallback
 }
