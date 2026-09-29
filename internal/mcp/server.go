@@ -79,11 +79,11 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 	var req rpcRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeRPC(w, nil, rpcError(-32700, "invalid JSON"))
+		writeRPCError(w, nil, -32700, "invalid JSON")
 		return
 	}
 	if req.JSONRPC != "" && req.JSONRPC != "2.0" {
-		writeRPC(w, req.ID, rpcError(-32600, "invalid JSON-RPC version"))
+		writeRPCError(w, req.ID, -32600, "invalid JSON-RPC version")
 		return
 	}
 
@@ -101,7 +101,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case "tools/call":
 		s.callTool(w, req.ID, req.Params)
 	default:
-		writeRPC(w, req.ID, rpcError(-32601, "method not found"))
+		writeRPCError(w, req.ID, -32601, "method not found")
 	}
 }
 
@@ -113,12 +113,19 @@ type rpcRequest struct {
 }
 
 func rpcError(code int, message string) map[string]any {
-	return map[string]any{"error": map[string]any{"code": code, "message": message}}
+	return map[string]any{"code": code, "message": message}
 }
 
 func writeRPC(w http.ResponseWriter, id any, result any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("MCP-Protocol-Version", protocolVersion)
 	_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+func writeRPCError(w http.ResponseWriter, id any, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("MCP-Protocol-Version", protocolVersion)
+	_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": id, "error": rpcError(code, message)})
 }
 
 func validBearer(r *http.Request, expected string) bool {
@@ -159,7 +166,7 @@ func (s *Server) callTool(w http.ResponseWriter, id any, params map[string]any) 
 	case "exec_command":
 		out, err = s.execCommand(context.Background(), args)
 	default:
-		writeRPC(w, id, rpcError(-32602, "unknown tool"))
+		writeRPCError(w, id, -32602, "unknown tool")
 		return
 	}
 	if err != nil {
