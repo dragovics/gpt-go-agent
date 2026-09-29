@@ -69,4 +69,4 @@ The remote URL is passed unchanged. The application API key is not passed to the
 
 ## Status
 
-Architecture foundations and the local executor lifecycle are in place. The next layer is the authenticated session/event bridge and concrete environment provisioning, followed by integration tests and reconnect handling.
+Architecture foundations and the local executor lifecycle are in place. The next production layer is webhook-driven provisioning/reconnect, signed event verification, durable task storage, observability, and end-to-end tests.
