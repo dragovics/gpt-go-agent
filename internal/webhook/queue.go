@@ -56,3 +56,4 @@ func (q *Queue) Recover() error {
 }
 
 func (q *Queue) Complete(j Job) { if q.journal != nil { _ = q.journal.Done(j) } }
+func (q *Queue) Dead(j Job, err error) { if q.journal != nil { _ = q.journal.Dead(j, err) } }
