@@ -18,11 +18,14 @@ type Queue struct {
 	mu sync.Mutex
 	ch chan Job
 	seen map[string]struct{}
+	journal *Journal
 }
 
-func NewQueue(size int) *Queue {
+func NewQueue(size int, journal ...*Journal) *Queue {
 	if size < 1 { size = 128 }
-	return &Queue{ch: make(chan Job, size), seen: make(map[string]struct{})}
+	q := &Queue{ch: make(chan Job, size), seen: make(map[string]struct{})}
+	if len(journal) > 0 { q.journal = journal[0] }
+	return q
 }
 
 func (q *Queue) Enqueue(j Job) bool {
@@ -30,6 +33,7 @@ func (q *Queue) Enqueue(j Job) bool {
 	defer q.mu.Unlock()
 	if j.ID == "" { return false }
 	if _, ok := q.seen[j.ID]; ok { return true }
+	if q.journal != nil { if err := q.journal.Enqueue(j); err != nil { return false } }
 	select {
 	case q.ch <- j:
 		q.seen[j.ID] = struct{}{}
@@ -40,3 +44,15 @@ func (q *Queue) Enqueue(j Job) bool {
 }
 
 func (q *Queue) Next() <-chan Job { return q.ch }
+
+func (q *Queue) Recover() error {
+	if q.journal == nil { return nil }
+	jobs, err := q.journal.Pending(); if err != nil { return err }
+	for _, j := range jobs {
+		if _, ok := q.seen[j.ID]; ok { continue }
+		select { case q.ch <- j: q.seen[j.ID] = struct{}{}; default: return nil }
+	}
+	return nil
+}
+
+func (q *Queue) Complete(j Job) { if q.journal != nil { _ = q.journal.Done(j) } }
