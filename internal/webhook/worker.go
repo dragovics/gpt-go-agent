@@ -23,10 +23,15 @@ type EnvironmentSupervisor interface {
 	Stop(string)
 }
 
+type SessionStore interface {
+	Put(sessionID, environmentID, remoteURL, state string) error
+}
+
 type Worker struct {
 	Queue *Queue
 	Reader SessionReader
 	Supervisor EnvironmentSupervisor
+	Sessions SessionStore
 }
 
 func (w *Worker) Run(ctx context.Context) {
