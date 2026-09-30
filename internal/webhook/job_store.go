@@ -22,6 +22,7 @@ func NewJobStore(path string) *JobStore {
 }
 
 func decodeJobStore(path string) (map[string]Job, error) {
+	// #nosec G304 -- path is derived exclusively from the service-configured job-store path, not request input.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
