@@ -122,16 +122,22 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("gpt-go-agent started")
+		log.Printf("gpt-go-agent HTTP server starting on %s", *listen)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("server: %v", err)
+			log.Fatalf("server fatal error: %v", err)
 		}
 	}()
 
 	<-ctx.Done()
+	log.Printf("Shutdown signal received, shutting down gracefully...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	} else {
+		log.Printf("Server exited gracefully")
+	}
 }
 
 func getenv(name, fallback string) string {
