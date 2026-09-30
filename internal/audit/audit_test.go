@@ -1,0 +1,38 @@
+package audit
+
+import (
+	"bufio"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestRecordSetsTimestampWhenMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger := New(path)
+	before := time.Now().UTC().Add(-time.Second)
+
+	if err := logger.Record(Event{Action: "test", Allowed: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	if !scanner.Scan() {
+		t.Fatal("expected one audit event")
+	}
+	var got Event
+	if err := json.Unmarshal(scanner.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Time.IsZero() || got.Time.Before(before) {
+		t.Fatalf("unexpected audit timestamp: %v", got.Time)
+	}
+}
