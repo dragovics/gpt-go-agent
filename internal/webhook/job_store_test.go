@@ -35,10 +35,10 @@ func TestWorkerRecoveryMarksInflightFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	gk := &mockGatekeeper{fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
-		return middleman.Decision{Approved: true, ExecType: "native", Command: "uptime"}, nil
+		return nativeDecision("uptime"), nil
 	}}
 	exec := &mockExecutor{}
-	w := NewWorker(gk, exec, Config{Workers: 1, Store: store})
+	w := mustWorker(t, gk, exec, Config{Workers: 1, Store: store})
 	defer w.Close()
 	job, ok := w.GetJob("j1")
 	if !ok {
@@ -103,5 +103,25 @@ func TestJobStorePruneBefore(t *testing.T) {
 	jobs := store.List()
 	if len(jobs) != 1 || jobs[0].ID != "live" {
 		t.Fatalf("remaining=%#v", jobs)
+	}
+}
+
+func TestJobStoreLoadsBackupWhenPrimaryMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.json")
+	store := NewJobStore(path)
+	if err := store.Put(Job{ID: "j1", Intent: "backup", Status: StatusCompleted, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, path+".bak"); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := NewJobStore(path)
+	if err := loaded.Load(); err != nil {
+		t.Fatalf("backup recovery failed: %v", err)
+	}
+	jobs := loaded.List()
+	if len(jobs) != 1 || jobs[0].ID != "j1" {
+		t.Fatalf("unexpected backup jobs: %#v", jobs)
 	}
 }

@@ -15,14 +15,14 @@ func TestParseDecisionJSON(t *testing.T) {
 		name     string
 		input    string
 		wantApp  bool
-		wantExec string
+		wantExec ExecType
 		wantErr  bool
 	}{
 		{
 			name:     "clean json approved native",
-			input:    `{"approved": true, "reason": "cek ping", "exec_type": "native", "command": "ping", "args": ["-c", "2", "8.8.8.8"]}`,
+			input:    `{"approved": true, "reason": "cek ping", "exec_type": "native", "native": {"command": "ping", "args": ["-c", "2", "8.8.8.8"]}}`,
 			wantApp:  true,
-			wantExec: "native",
+			wantExec: ExecNative,
 			wantErr:  false,
 		},
 		{
@@ -31,7 +31,7 @@ func TestParseDecisionJSON(t *testing.T) {
 				`{"approved": true, "reason": "refactor modul", "exec_type": "codex", "command": "refactor auth.go", "args": []}` +
 				"\n```",
 			wantApp:  true,
-			wantExec: "codex",
+			wantExec: ExecCodex,
 			wantErr:  false,
 		},
 		{
@@ -40,6 +40,11 @@ func TestParseDecisionJSON(t *testing.T) {
 			wantApp:  false,
 			wantExec: "",
 			wantErr:  false,
+		},
+		{
+			name:    "approved native missing plan",
+			input:   `{"approved": true, "exec_type": "native"}`,
+			wantErr: true,
 		},
 		{
 			name:    "invalid json",
@@ -60,6 +65,12 @@ func TestParseDecisionJSON(t *testing.T) {
 				}
 				if got.ExecType != tt.wantExec {
 					t.Errorf("got.ExecType = %v, want %v", got.ExecType, tt.wantExec)
+				}
+				if got.Approved && got.ExecType == ExecNative && got.Native == nil {
+					t.Error("approved native decision was not normalized")
+				}
+				if got.Approved && got.ExecType == ExecCodex && got.Codex == nil {
+					t.Error("approved codex decision was not normalized")
 				}
 			}
 		})
@@ -85,9 +96,8 @@ func TestLLMGatekeeper_Evaluate(t *testing.T) {
 		decision := Decision{
 			Approved: true,
 			Reason:   "Perintah diizinkan",
-			ExecType: "native",
-			Command:  "uptime",
-			Args:     []string{},
+			ExecType: ExecNative,
+			Native:   &NativePlan{Command: "uptime"},
 		}
 		for _, m := range req.Messages {
 			if m.Role == "user" && strings.Contains(m.Content, "rm -") {
@@ -139,7 +149,7 @@ func TestLLMGatekeeper_Evaluate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate error: %v", err)
 	}
-	if !dec.Approved || dec.Command != "uptime" || dec.ExecType != "native" {
+	if !dec.Approved || dec.Native == nil || dec.Native.Command != "uptime" || dec.ExecType != ExecNative {
 		t.Errorf("unexpected decision for safe intent: %+v", dec)
 	}
 
@@ -161,7 +171,7 @@ func TestLLMGatekeeperRetriesTransientFailures(t *testing.T) {
 			http.Error(w, "temporary", http.StatusServiceUnavailable)
 			return
 		}
-		dec, _ := json.Marshal(Decision{Approved: true, ExecType: "native", Command: "uptime"})
+		dec, _ := json.Marshal(Decision{Approved: true, ExecType: ExecNative, Native: &NativePlan{Command: "uptime"}})
 		w.Header().Set("Content-Type", "application/json")
 		payload := map[string]any{"choices": []any{map[string]any{"message": map[string]string{"content": string(dec)}}}}
 		_ = json.NewEncoder(w).Encode(payload)

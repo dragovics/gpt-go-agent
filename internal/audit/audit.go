@@ -3,6 +3,7 @@ package audit
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -16,21 +17,36 @@ type Event struct {
 	CorrelationID string    `json:"correlation_id,omitempty"`
 	DurationMS    int64     `json:"duration_ms,omitempty"`
 }
+
 type Logger struct {
 	mu   sync.Mutex
 	path string
 }
 
-func New(path string) *Logger { return &Logger{path: path} }
+func New(path string) *Logger {
+	return &Logger{path: path}
+}
+
 func (l *Logger) Record(e Event) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	e.Time = e.Time.UTC()
+
+	if e.Time.IsZero() {
+		e.Time = time.Now().UTC()
+	} else {
+		e.Time = e.Time.UTC()
+	}
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	dir := filepath.Dir(l.path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

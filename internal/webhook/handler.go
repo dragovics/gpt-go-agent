@@ -3,6 +3,7 @@ package webhook
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,7 +45,7 @@ func (l *requestLimiter) allow(now time.Time) bool {
 // Handler returns an http.Handler that manages webhook ingestion and status queries.
 func (w *Worker) Handler() http.Handler {
 	mux := http.NewServeMux()
-	limiter := &requestLimiter{limit: 120}
+	limiter := &requestLimiter{limit: w.rateLimitPerMinute}
 
 	authorized := func(rw http.ResponseWriter, req *http.Request) bool {
 		if !w.requireWebhookAuth {
@@ -90,11 +91,14 @@ func (w *Worker) Handler() http.Handler {
 			job, duplicate, err := w.EnqueueWithKeyAndCorrelation(body.Intent, body.Context, req.Header.Get("Idempotency-Key"), correlationID)
 			if err != nil {
 				status := http.StatusServiceUnavailable
-				if strings.Contains(err.Error(), "too long") || strings.Contains(err.Error(), "cannot be empty") {
+				switch {
+				case errors.Is(err, ErrInvalidInput):
 					status = http.StatusBadRequest
-				}
-				if strings.Contains(err.Error(), "idempotency key conflicts") {
+				case errors.Is(err, ErrIdempotencyConflict):
 					status = http.StatusConflict
+				case errors.Is(err, ErrJobCapacity), errors.Is(err, ErrQueueFull):
+					status = http.StatusTooManyRequests
+					rw.Header().Set("Retry-After", "60")
 				}
 				http.Error(rw, err.Error(), status)
 				return

@@ -23,22 +23,37 @@ func NewJobStore(path string) *JobStore {
 func (s *JobStore) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	data, err := os.ReadFile(s.path)
-	if os.IsNotExist(err) {
-		return nil
+
+	primary, primaryErr := os.ReadFile(s.path)
+	if primaryErr == nil {
+		var jobs map[string]Job
+		if err := json.Unmarshal(primary, &jobs); err == nil {
+			if jobs == nil {
+				jobs = make(map[string]Job)
+			}
+			s.jobs = jobs
+			return nil
+		}
+	} else if !os.IsNotExist(primaryErr) {
+		return primaryErr
 	}
-	if err != nil {
-		return err
+
+	backup, backupErr := os.ReadFile(s.path + ".bak")
+	if backupErr != nil {
+		if os.IsNotExist(primaryErr) && os.IsNotExist(backupErr) {
+			return nil
+		}
+		if primaryErr != nil && !os.IsNotExist(primaryErr) {
+			return primaryErr
+		}
+		return backupErr
 	}
 	var jobs map[string]Job
-	if err := json.Unmarshal(data, &jobs); err != nil {
-		backup, backupErr := os.ReadFile(s.path + ".bak")
-		if backupErr != nil {
-			return err
+	if err := json.Unmarshal(backup, &jobs); err != nil {
+		if primaryErr == nil {
+			return errors.New("primary and backup webhook stores are corrupt")
 		}
-		if backupErr = json.Unmarshal(backup, &jobs); backupErr != nil {
-			return err
-		}
+		return err
 	}
 	if jobs == nil {
 		jobs = make(map[string]Job)
@@ -142,12 +157,17 @@ func (s *JobStore) writeLocked() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	rotated := false
 	if _, err := os.Stat(s.path); err == nil {
 		if err := os.Rename(s.path, s.path+".bak"); err != nil {
 			return err
 		}
+		rotated = true
 	}
 	if err := os.Rename(tmpName, s.path); err != nil {
+		if rotated {
+			_ = os.Rename(s.path+".bak", s.path)
+		}
 		return err
 	}
 	// #nosec G304 -- dir is derived from the service-configured store path and is not request-controlled.
