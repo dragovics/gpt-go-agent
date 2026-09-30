@@ -61,9 +61,10 @@ type Executor interface {
 
 // DefaultExecutor implements Executor using local os/exec.
 type DefaultExecutor struct {
-	Workspace      string
-	CodexBin       string // path to codex CLI
-	MaxOutputBytes int
+	Workspace       string
+	CodexBin        string // path to codex CLI
+	CodexAllowWrite bool
+	MaxOutputBytes  int
 }
 
 type boundedBuffer struct {
@@ -152,8 +153,12 @@ func (e *DefaultExecutor) ExecuteCodex(ctx context.Context, prompt string, targe
 	if dir == "" {
 		dir = e.Workspace
 	}
-	// #nosec G204 -- Codex binary is service configuration and execution is confined to workspace-write sandboxing.
-	cmd := exec.CommandContext(ctx, bin, "exec", "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", dir, prompt)
+	sandbox := "read-only"
+	if e.CodexAllowWrite {
+		sandbox = "workspace-write"
+	}
+	// #nosec G204 -- Codex binary is service configuration; sandbox mode is selected from fixed trusted values.
+	cmd := exec.CommandContext(ctx, bin, "exec", "--sandbox", sandbox, "--skip-git-repo-check", "-C", dir, prompt)
 	cmd.Env = security.ChildEnvironment(os.Environ())
 	var out boundedBuffer
 	out.limit = e.MaxOutputBytes
