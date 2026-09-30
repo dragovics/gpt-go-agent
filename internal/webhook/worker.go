@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dragovics/gpt-go-agent/internal/audit"
@@ -61,9 +62,11 @@ type Executor interface {
 
 // DefaultExecutor implements Executor using local os/exec.
 type DefaultExecutor struct {
-	Workspace      string
-	CodexBin       string // path to codex CLI
-	MaxOutputBytes int
+	Workspace       string
+	CodexBin        string // path to codex CLI
+	MaxOutputBytes  int
+	CodexEnabled    bool
+	CodexAllowWrite bool
 }
 
 type boundedBuffer struct {
@@ -107,10 +110,11 @@ func (b *boundedBuffer) String() string {
 func (e *DefaultExecutor) ExecuteNative(ctx context.Context, command string, args []string) (string, error) {
 	// #nosec G204 -- native commands pass the deterministic validateNativeCommand gate before execution.
 	cmd := exec.CommandContext(ctx, command, args...)
+	security.ConfigureProcessGroup(cmd)
 	if e.Workspace != "" {
 		cmd.Dir = e.Workspace
 	}
-	cmd.Env = security.SanitizedEnvironment(os.Environ())
+	cmd.Env = security.MinimalEnvironment(os.Environ())
 	var out boundedBuffer
 	out.limit = e.MaxOutputBytes
 	cmd.Stdout = &out
@@ -141,6 +145,9 @@ func validateCodexPrompt(prompt, workspace, targetDir string) error {
 }
 
 func (e *DefaultExecutor) ExecuteCodex(ctx context.Context, prompt string, targetDir string) (string, error) {
+	if !e.CodexEnabled {
+		return "", errors.New("codex execution is disabled")
+	}
 	if err := validateCodexPrompt(prompt, e.Workspace, targetDir); err != nil {
 		return "", err
 	}
@@ -152,8 +159,13 @@ func (e *DefaultExecutor) ExecuteCodex(ctx context.Context, prompt string, targe
 	if dir == "" {
 		dir = e.Workspace
 	}
-	// #nosec G204 -- Codex binary is service configuration and execution is confined to workspace-write sandboxing.
-	cmd := exec.CommandContext(ctx, bin, "exec", "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", dir, prompt)
+	sandbox := "read-only"
+	if e.CodexAllowWrite {
+		sandbox = "workspace-write"
+	}
+	// #nosec G204 -- Codex binary is service configuration and sandbox mode is explicit service policy.
+	cmd := exec.CommandContext(ctx, bin, "exec", "--sandbox", sandbox, "--skip-git-repo-check", "-C", dir, prompt)
+	security.ConfigureProcessGroup(cmd)
 	cmd.Env = security.ChildEnvironment(os.Environ())
 	var out boundedBuffer
 	out.limit = e.MaxOutputBytes
@@ -169,7 +181,7 @@ func (e *DefaultExecutor) ExecuteCodex(ctx context.Context, prompt string, targe
 
 // Worker coordinates intent evaluation via Middleman and dispatches execution.
 type Worker struct {
-	gatekeeper         middleman.Gatekeeper
+	planner            middleman.Planner
 	executor           Executor
 	store              *JobStore
 	webhookSecret      string
@@ -182,10 +194,14 @@ type Worker struct {
 	idempotency        map[string]string
 	retention          time.Duration
 	cleanupInterval    time.Duration
-	maxGatekeeperRetry int
+	maxPlannerRetry    int
 	retryBaseDelay     time.Duration
 	auditor            *audit.Logger
 	maxOutputBytes     int
+	jobTimeout         time.Duration
+	maxJobs            int
+	rateLimitPerMinute int
+	storageHealthy     atomic.Bool
 	ctx                context.Context
 	cancel             context.CancelFunc
 	wg                 sync.WaitGroup
@@ -195,6 +211,10 @@ type Worker struct {
 // Config configures the Webhook Worker pool.
 type Config struct {
 	Workers              int
+	QueueSize            int
+	MaxJobs              int
+	RateLimitPerMinute   int
+	JobTimeout           time.Duration
 	Store                *JobStore
 	WebhookSecret        string
 	RequireWebhookAuth   bool
@@ -207,9 +227,27 @@ type Config struct {
 }
 
 // NewWorker creates and starts a Worker pool.
-func NewWorker(gk middleman.Gatekeeper, exec Executor, cfg Config) *Worker {
+func NewWorker(planner middleman.Planner, exec Executor, cfg Config) (*Worker, error) {
+	if planner == nil {
+		return nil, errors.New("planner is required")
+	}
+	if exec == nil {
+		return nil, errors.New("executor is required")
+	}
 	if cfg.Workers <= 0 {
 		cfg.Workers = 2
+	}
+	if cfg.QueueSize <= 0 {
+		cfg.QueueSize = 100
+	}
+	if cfg.MaxJobs <= 0 {
+		cfg.MaxJobs = 10_000
+	}
+	if cfg.RateLimitPerMinute <= 0 {
+		cfg.RateLimitPerMinute = 120
+	}
+	if cfg.JobTimeout <= 0 {
+		cfg.JobTimeout = 180 * time.Second
 	}
 	if cfg.Retention <= 0 {
 		cfg.Retention = 7 * 24 * time.Hour
@@ -226,31 +264,37 @@ func NewWorker(gk middleman.Gatekeeper, exec Executor, cfg Config) *Worker {
 	if cfg.MaxOutputBytes <= 0 {
 		cfg.MaxOutputBytes = 64 * 1024
 	}
+
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	w := &Worker{
-		gatekeeper:         gk,
+		planner:            planner,
 		executor:           exec,
 		store:              cfg.Store,
 		webhookSecret:      cfg.WebhookSecret,
 		requireWebhookAuth: cfg.RequireWebhookAuth,
 		jobs:               make(map[string]*Job),
-		queue:              make(chan *Job, 100),
+		queue:              make(chan *Job, cfg.QueueSize),
 		workers:            cfg.Workers,
 		quit:               make(chan struct{}),
 		idempotency:        make(map[string]string),
 		retention:          cfg.Retention,
 		cleanupInterval:    cfg.CleanupInterval,
-		maxGatekeeperRetry: cfg.MaxGatekeeperRetries,
+		maxPlannerRetry:    cfg.MaxGatekeeperRetries,
 		retryBaseDelay:     cfg.RetryBaseDelay,
 		auditor:            cfg.Auditor,
 		maxOutputBytes:     cfg.MaxOutputBytes,
+		jobTimeout:         cfg.JobTimeout,
+		maxJobs:            cfg.MaxJobs,
+		rateLimitPerMinute: cfg.RateLimitPerMinute,
 		ctx:                workerCtx,
 		cancel:             workerCancel,
 	}
+	w.storageHealthy.Store(true)
 
 	if w.store != nil {
 		if err := w.store.Load(); err != nil {
-			panic(fmt.Sprintf("load webhook job store: %v", err))
+			workerCancel()
+			return nil, fmt.Errorf("load webhook job store: %w", err)
 		}
 		for _, stored := range w.store.List() {
 			job := stored
@@ -264,15 +308,19 @@ func NewWorker(gk middleman.Gatekeeper, exec Executor, cfg Config) *Worker {
 		}
 	}
 
+	w.recoverJobs()
+
 	for i := 0; i < w.workers; i++ {
 		w.wg.Add(1)
 		go w.runLoop()
 	}
-
-	w.recoverJobs()
 	w.wg.Add(1)
 	go w.cleanupLoop()
-	return w
+	return w, nil
+}
+
+func (w *Worker) Ready() bool {
+	return w.storageHealthy.Load()
 }
 
 func (w *Worker) cleanupLoop() {
@@ -296,9 +344,11 @@ func (w *Worker) cleanup() {
 	}
 	ids, err := w.store.PruneBefore(time.Now().UTC().Add(-w.retention))
 	if err != nil {
+		w.storageHealthy.Store(false)
 		log.Printf("webhook retention cleanup: %v", err)
 		return
 	}
+	w.storageHealthy.Store(true)
 	if len(ids) == 0 {
 		return
 	}
@@ -329,7 +379,10 @@ func (w *Worker) recoverJobs() {
 			job.UpdatedAt = now
 			if w.store != nil {
 				if err := w.store.Put(*job); err != nil {
+					w.storageHealthy.Store(false)
 					log.Printf("webhook store recovery persist %s: %v", job.ID, err)
+				} else {
+					w.storageHealthy.Store(true)
 				}
 			}
 		}
@@ -341,10 +394,12 @@ func (w *Worker) recoverJobs() {
 		select {
 		case w.queue <- &queuedJob:
 		default:
-			w.updateJob(job.ID, func(j *Job) {
+			if err := w.updateJob(job.ID, func(j *Job) {
 				j.Status = StatusFailed
 				j.Error = "recovery queue is full"
-			})
+			}); err != nil {
+				log.Printf("webhook recovery queue failure persist %s: %v", job.ID, err)
+			}
 		}
 	}
 }
@@ -391,14 +446,14 @@ func (w *Worker) EnqueueWithKey(intent string, extraContext string, key string) 
 func (w *Worker) EnqueueWithKeyAndCorrelation(intent string, extraContext string, key string, correlationID string) (*Job, bool, error) {
 	intent = strings.TrimSpace(intent)
 	if intent == "" {
-		return nil, false, errors.New("intent cannot be empty")
+		return nil, false, fmt.Errorf("%w: intent cannot be empty", ErrInvalidInput)
 	}
 	if len(intent) > 32768 || len(extraContext) > 32768 {
-		return nil, false, errors.New("request too large")
+		return nil, false, fmt.Errorf("%w: request too large", ErrInvalidInput)
 	}
 	key = strings.TrimSpace(key)
 	if len(key) > 256 {
-		return nil, false, errors.New("idempotency key too long")
+		return nil, false, fmt.Errorf("%w: idempotency key too long", ErrInvalidInput)
 	}
 	hash := requestHash(intent, extraContext)
 	correlationID = strings.TrimSpace(correlationID)
@@ -406,63 +461,67 @@ func (w *Worker) EnqueueWithKeyAndCorrelation(intent string, extraContext string
 		correlationID = randomID("corr-")
 	}
 	if len(correlationID) > 128 {
-		return nil, false, errors.New("correlation id too long")
+		return nil, false, fmt.Errorf("%w: correlation id too long", ErrInvalidInput)
 	}
+
 	w.mu.Lock()
 	if key != "" {
 		if existingID, ok := w.idempotency[key]; ok {
 			if existing, ok := w.jobs[existingID]; ok {
 				if existing.RequestHash != "" && existing.RequestHash != hash {
 					w.mu.Unlock()
-					return nil, false, errors.New("idempotency key conflicts with an existing request")
+					return nil, false, fmt.Errorf("%w: key is already bound to different request content", ErrIdempotencyConflict)
 				}
-				cp := *existing
+				cp := cloneJob(existing)
 				w.mu.Unlock()
-				return &cp, true, nil
+				return cp, true, nil
 			}
 		}
 	}
-	id := randomID("job-")
+	if len(w.jobs) >= w.maxJobs {
+		w.mu.Unlock()
+		return nil, false, ErrJobCapacity
+	}
+
+	now := time.Now().UTC()
 	job := &Job{
-		ID:             id,
+		ID:             randomID("job-"),
 		Intent:         intent,
 		Context:        extraContext,
 		IdempotencyKey: key,
 		RequestHash:    hash,
 		CorrelationID:  correlationID,
 		Status:         StatusPending,
-		CreatedAt:      time.Now().UTC(),
-		UpdatedAt:      time.Now().UTC(),
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
-	w.jobs[id] = job
-	if key != "" {
-		w.idempotency[key] = id
-	}
-	w.mu.Unlock()
-
 	if w.store != nil {
 		if err := w.store.Put(*job); err != nil {
-			w.mu.Lock()
-			delete(w.jobs, id)
-			if key != "" {
-				delete(w.idempotency, key)
-			}
+			w.storageHealthy.Store(false)
 			w.mu.Unlock()
 			return nil, false, fmt.Errorf("persist webhook job: %w", err)
 		}
+		w.storageHealthy.Store(true)
 	}
+	w.jobs[job.ID] = job
+	if key != "" {
+		w.idempotency[key] = job.ID
+	}
+	queuedJob := cloneJob(job)
+	w.mu.Unlock()
 
-	queuedJob := *job
 	select {
-	case w.queue <- &queuedJob:
-		w.recordAudit(queuedJob, "webhook.enqueue", true, "accepted", 0)
-		return &queuedJob, false, nil
+	case w.queue <- queuedJob:
+		w.recordAudit(*queuedJob, "webhook.enqueue", true, "accepted", 0)
+		return queuedJob, false, nil
 	default:
-		w.updateJob(job.ID, func(j *Job) {
+		_ = w.updateJob(job.ID, func(j *Job) {
 			j.Status = StatusFailed
 			j.Error = "queue is full"
+			t := time.Now().UTC()
+			j.CompletedAt = &t
 		})
-		return nil, false, errors.New("webhook worker queue is full")
+		return nil, false, ErrQueueFull
 	}
 }
 
@@ -479,8 +538,7 @@ func (w *Worker) ListJobs(limit, offset int) ([]*Job, int) {
 	w.mu.RLock()
 	all := make([]*Job, 0, len(w.jobs))
 	for _, j := range w.jobs {
-		cp := *j
-		all = append(all, &cp)
+		all = append(all, cloneJob(j))
 	}
 	w.mu.RUnlock()
 	sort.Slice(all, func(i, j int) bool {
@@ -508,28 +566,52 @@ func (w *Worker) GetJob(id string) (*Job, bool) {
 	if !ok {
 		return nil, false
 	}
-	// Return shallow copy
-	cp := *j
-	return &cp, true
+	return cloneJob(j), true
 }
 
-func (w *Worker) updateJob(id string, fn func(*Job)) {
-	w.mu.Lock()
-	j, ok := w.jobs[id]
-	if !ok {
-		w.mu.Unlock()
-		return
+func cloneJob(j *Job) *Job {
+	if j == nil {
+		return nil
 	}
-	fn(j)
-	j.UpdatedAt = time.Now().UTC()
 	cp := *j
-	w.mu.Unlock()
-
-	if w.store != nil {
-		if err := w.store.Put(cp); err != nil {
-			log.Printf("webhook store persist %s: %v", id, err)
+	if j.Decision != nil {
+		decision := *j.Decision
+		if j.Decision.Native != nil {
+			native := *j.Decision.Native
+			native.Args = append([]string(nil), j.Decision.Native.Args...)
+			decision.Native = &native
 		}
+		if j.Decision.Codex != nil {
+			codex := *j.Decision.Codex
+			decision.Codex = &codex
+		}
+		cp.Decision = &decision
 	}
+	return &cp
+}
+
+// updateJob persists the new state before publishing it in memory. This keeps
+// the visible state from getting ahead of durable state on storage failures.
+func (w *Worker) updateJob(id string, fn func(*Job)) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	current, ok := w.jobs[id]
+	if !ok {
+		return errors.New("job not found")
+	}
+	next := cloneJob(current)
+	fn(next)
+	next.UpdatedAt = time.Now().UTC()
+	if w.store != nil {
+		if err := w.store.Put(*next); err != nil {
+			w.storageHealthy.Store(false)
+			return fmt.Errorf("persist job %s: %w", id, err)
+		}
+		w.storageHealthy.Store(true)
+	}
+	w.jobs[id] = next
+	return nil
 }
 
 func (w *Worker) recordAudit(job Job, action string, allowed bool, detail string, duration time.Duration) {
@@ -543,7 +625,7 @@ func (w *Worker) recordAudit(job Job, action string, allowed bool, detail string
 
 func (w *Worker) failJob(id string, err error, deadLetter bool) {
 	now := time.Now().UTC()
-	w.updateJob(id, func(j *Job) {
+	if persistErr := w.updateJob(id, func(j *Job) {
 		j.Status = StatusFailed
 		j.Error = err.Error()
 		j.CompletedAt = &now
@@ -551,10 +633,20 @@ func (w *Worker) failJob(id string, err error, deadLetter bool) {
 			j.DeadLettered = true
 			j.DeadLetteredAt = &now
 		}
-	})
+	}); persistErr != nil {
+		log.Printf("webhook fail state persist %s: %v", id, persistErr)
+	}
 	if job, ok := w.GetJob(id); ok {
 		w.recordAudit(*job, "webhook.failure", false, err.Error(), time.Since(job.CreatedAt))
 	}
+}
+
+func (w *Worker) startRetry(jobID string, delay time.Duration) {
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		w.scheduleRetry(jobID, delay)
+	}()
 }
 
 func (w *Worker) scheduleRetry(jobID string, delay time.Duration) {
@@ -580,100 +672,97 @@ func (w *Worker) scheduleRetry(jobID string, delay time.Duration) {
 // processJob performs the evaluation -> policy enforcement -> execution pipeline.
 func (w *Worker) processJob(job *Job) {
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(w.ctx, 180*time.Second)
+	ctx, cancel := context.WithTimeout(w.ctx, w.jobTimeout)
 	defer cancel()
 
-	w.updateJob(job.ID, func(j *Job) { j.Status = StatusEvaluating })
+	if err := w.updateJob(job.ID, func(j *Job) { j.Status = StatusEvaluating }); err != nil {
+		log.Printf("webhook refusing to evaluate %s without durable state: %v", job.ID, err)
+		return
+	}
 
-	// Step 1: Evaluate intent via Middleman Gatekeeper
-	dec, err := w.gatekeeper.Evaluate(ctx, job.Intent, job.Context)
+	// Step 1: Evaluate intent via Middleman planner
+	dec, err := w.planner.Evaluate(ctx, job.Intent, job.Context)
 	if err != nil {
-		if middleman.IsRetryableError(err) && job.RetryCount < w.maxGatekeeperRetry {
+		if middleman.IsRetryableError(err) && job.RetryCount < w.maxPlannerRetry {
 			attempt := job.RetryCount + 1
-			w.updateJob(job.ID, func(j *Job) {
+			if persistErr := w.updateJob(job.ID, func(j *Job) {
 				j.Status = StatusPending
 				j.RetryCount = attempt
-				j.Error = fmt.Sprintf("gatekeeper retry %d/%d: %v", attempt, w.maxGatekeeperRetry, err)
-			})
+				j.Error = fmt.Sprintf("planner retry %d/%d: %v", attempt, w.maxPlannerRetry, err)
+			}); persistErr != nil {
+				log.Printf("webhook retry state persist %s: %v", job.ID, persistErr)
+				return
+			}
 			delay := w.retryBaseDelay * time.Duration(1<<(attempt-1))
 			if delay > 10*time.Second {
 				delay = 10 * time.Second
 			}
-			go w.scheduleRetry(job.ID, delay)
+			delay = middleman.RetryDelay(err, delay)
+			w.startRetry(job.ID, delay)
 			return
 		}
-		w.failJob(job.ID, fmt.Errorf("gatekeeper evaluation error: %w", err), true)
+		w.failJob(job.ID, fmt.Errorf("planner evaluation error: %w", err), true)
 		return
 	}
 
-	w.updateJob(job.ID, func(j *Job) { j.Decision = &dec })
+	if err := w.updateJob(job.ID, func(j *Job) { j.Decision = &dec }); err != nil {
+		log.Printf("webhook refusing to execute %s without durable decision: %v", job.ID, err)
+		return
+	}
 	if current, ok := w.GetJob(job.ID); ok {
 		w.recordAudit(*current, "webhook.policy", dec.Approved, dec.Reason, time.Since(started))
 	}
 
-	// Step 2: Policy Enforcement (Satpam) Check
+	// Step 2: The planner can reject intent, but approval is not authorization.
+	// Local deterministic policy still gates every executable action.
 	if !dec.Approved {
-		w.updateJob(job.ID, func(j *Job) {
+		_ = w.updateJob(job.ID, func(j *Job) {
 			j.Status = StatusRejected
-			j.Error = fmt.Sprintf("policy rejected: %s", dec.Reason)
+			j.Error = fmt.Sprintf("planner rejected: %s", dec.Reason)
 			now := time.Now().UTC()
 			j.CompletedAt = &now
 		})
 		return
 	}
 
-	// Step 3: Deterministic execution gate before any process is spawned.
-	if strings.TrimSpace(dec.Command) == "" {
-		w.updateJob(job.ID, func(j *Job) {
-			j.Status = StatusFailed
-			j.Error = "execution denied: empty command"
-			now := time.Now().UTC()
-			j.CompletedAt = &now
-		})
+	if err := w.updateJob(job.ID, func(j *Job) { j.Status = StatusRunning }); err != nil {
+		log.Printf("webhook refusing to execute %s without durable running state: %v", job.ID, err)
 		return
 	}
-
-	w.updateJob(job.ID, func(j *Job) { j.Status = StatusRunning })
 
 	var out string
 	var execErr error
 
 	switch dec.ExecType {
-	case "codex":
-		if len(dec.Args) != 0 {
-			w.updateJob(job.ID, func(j *Job) {
-				j.Status = StatusFailed
-				j.Error = "execution denied: codex decision must not contain native args"
-				now := time.Now().UTC()
-				j.CompletedAt = &now
-			})
+	case middleman.ExecCodex:
+		if dec.Codex == nil || strings.TrimSpace(dec.Codex.Prompt) == "" {
+			w.failJob(job.ID, errors.New("execution denied: codex plan is missing"), false)
 			return
 		}
-		out, execErr = w.executor.ExecuteCodex(ctx, dec.Command, "")
-	case "native":
-		if err := validateNativeCommand(dec.Command, dec.Args, ""); err != nil {
-			w.updateJob(job.ID, func(j *Job) {
-				j.Status = StatusFailed
-				j.Error = "execution denied: " + err.Error()
-				now := time.Now().UTC()
-				j.CompletedAt = &now
-			})
+		out, execErr = w.executor.ExecuteCodex(ctx, dec.Codex.Prompt, "")
+	case middleman.ExecNative:
+		if dec.Native == nil {
+			w.failJob(job.ID, errors.New("execution denied: native plan is missing"), false)
 			return
 		}
-		out, execErr = w.executor.ExecuteNative(ctx, dec.Command, dec.Args)
+		if err := validateNativeCommand(dec.Native.Command, dec.Native.Args, ""); err != nil {
+			w.failJob(job.ID, errors.New("execution denied: "+err.Error()), false)
+			return
+		}
+		out, execErr = w.executor.ExecuteNative(ctx, dec.Native.Command, dec.Native.Args)
 	default:
-		w.updateJob(job.ID, func(j *Job) {
-			j.Status = StatusFailed
-			j.Error = fmt.Sprintf("execution denied: unknown exec_type %q", dec.ExecType)
-			now := time.Now().UTC()
-			j.CompletedAt = &now
-		})
+		w.failJob(job.ID, fmt.Errorf("execution denied: unknown exec_type %q", dec.ExecType), false)
 		return
+	}
+
+	out = boundedText(out, w.maxOutputBytes)
+	if execErr != nil {
+		execErr = errors.New(boundedText(execErr.Error(), w.maxOutputBytes))
 	}
 
 	now := time.Now().UTC()
 	duration := time.Since(started)
-	w.updateJob(job.ID, func(j *Job) {
+	if err := w.updateJob(job.ID, func(j *Job) {
 		j.CompletedAt = &now
 		j.DurationMS = duration.Milliseconds()
 		j.Output = out
@@ -685,10 +774,19 @@ func (w *Worker) processJob(job *Job) {
 		} else {
 			j.Status = StatusCompleted
 		}
-	})
+	}); err != nil {
+		log.Printf("webhook final state persist %s: %v", job.ID, err)
+	}
 	if final, ok := w.GetJob(job.ID); ok {
 		w.recordAudit(*final, "webhook.execute", execErr == nil, final.Error, duration)
 	}
+}
+
+func boundedText(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "\n[output truncated]"
 }
 
 // Close gracefully stops the worker pool.

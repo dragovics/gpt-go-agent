@@ -14,13 +14,126 @@ import (
 	"time"
 )
 
-// Decision represents the structured judgment from the middleman gatekeeper (Satpam + Mandor).
+// ExecType identifies a concrete local execution plan.
+type ExecType string
+
+const (
+	ExecNative ExecType = "native"
+	ExecCodex  ExecType = "codex"
+)
+
+type NativePlan struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args,omitempty"`
+}
+
+type CodexPlan struct {
+	Prompt string `json:"prompt"`
+}
+
+// Decision is the planner output consumed by deterministic local policy.
+// Native executable data and Codex prompts are deliberately separate types.
 type Decision struct {
-	Approved bool     `json:"approved"`
-	Reason   string   `json:"reason,omitempty"`
-	ExecType string   `json:"exec_type,omitempty"` // "native" (shell/api, $0 quota) or "codex" (heavy coding)
-	Command  string   `json:"command,omitempty"`
-	Args     []string `json:"args,omitempty"`
+	Approved bool        `json:"approved"`
+	Reason   string      `json:"reason,omitempty"`
+	ExecType ExecType    `json:"exec_type,omitempty"`
+	Native   *NativePlan `json:"native,omitempty"`
+	Codex    *CodexPlan  `json:"codex,omitempty"`
+}
+
+type decisionWire struct {
+	Approved bool        `json:"approved"`
+	Reason   string      `json:"reason,omitempty"`
+	ExecType ExecType    `json:"exec_type,omitempty"`
+	Native   *NativePlan `json:"native,omitempty"`
+	Codex    *CodexPlan  `json:"codex,omitempty"`
+
+	// Legacy fields accepted for backward compatibility with older Middleman
+	// prompts and persisted job records.
+	Command string   `json:"command,omitempty"`
+	Args    []string `json:"args,omitempty"`
+}
+
+func (d Decision) MarshalJSON() ([]byte, error) {
+	return json.Marshal(decisionWire{
+		Approved: d.Approved,
+		Reason:   d.Reason,
+		ExecType: d.ExecType,
+		Native:   d.Native,
+		Codex:    d.Codex,
+	})
+}
+
+func (d *Decision) UnmarshalJSON(data []byte) error {
+	var wire decisionWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	next := Decision{
+		Approved: wire.Approved,
+		Reason:   wire.Reason,
+		ExecType: wire.ExecType,
+		Native:   wire.Native,
+		Codex:    wire.Codex,
+	}
+	if next.Native == nil && next.Codex == nil && wire.Command != "" {
+		switch wire.ExecType {
+		case ExecNative:
+			next.Native = &NativePlan{Command: wire.Command, Args: wire.Args}
+		case ExecCodex:
+			if len(wire.Args) != 0 {
+				return errors.New("legacy codex decision must not contain native args")
+			}
+			next.Codex = &CodexPlan{Prompt: wire.Command}
+		}
+	}
+	if err := validateDecision(next); err != nil {
+		return err
+	}
+	*d = next
+	return nil
+}
+
+func validateDecision(d Decision) error {
+	if d.ExecType != "" && d.ExecType != ExecNative && d.ExecType != ExecCodex {
+		return fmt.Errorf("invalid exec_type %q", d.ExecType)
+	}
+	if !d.Approved {
+		return nil
+	}
+	switch d.ExecType {
+	case ExecNative:
+		if d.Native == nil || strings.TrimSpace(d.Native.Command) == "" {
+			return errors.New("approved native decision requires native.command")
+		}
+		if d.Codex != nil {
+			return errors.New("native decision must not contain codex plan")
+		}
+		if len(d.Native.Command) > 256 {
+			return errors.New("decision command too long")
+		}
+		if len(d.Native.Args) > 32 {
+			return errors.New("too many decision args")
+		}
+		for _, arg := range d.Native.Args {
+			if len(arg) > 4096 {
+				return errors.New("decision argument too long")
+			}
+		}
+	case ExecCodex:
+		if d.Codex == nil || strings.TrimSpace(d.Codex.Prompt) == "" {
+			return errors.New("approved codex decision requires codex.prompt")
+		}
+		if d.Native != nil {
+			return errors.New("codex decision must not contain native plan")
+		}
+		if len(d.Codex.Prompt) > 32768 {
+			return errors.New("codex prompt too large")
+		}
+	default:
+		return errors.New("approved decision requires exec_type")
+	}
+	return nil
 }
 
 // Config holds the configuration for the Middleman LLM client.
@@ -30,23 +143,32 @@ type Config struct {
 	Model                   string
 	Timeout                 time.Duration
 	SystemPrompt            string
+	UserAgent               string
+	CompatibilityProfile    string
 	MaxAttempts             int
 	RetryBaseDelay          time.Duration
 	CircuitFailureThreshold int
 	CircuitOpenDuration     time.Duration
 }
 
-// DefaultSystemPrompt is the default instructions for the Satpam (Policy Enforcer) + Mandor (Technical Translator).
-const DefaultSystemPrompt = `Return one valid JSON object with these fields: approved, reason, exec_type, command, args.
-Use approved=true for ordinary harmless requests and approved=false when the request is clearly not appropriate.
-Use exec_type native or codex. Keep reason brief. Return JSON only.`
+// DefaultSystemPrompt asks the remote model to produce a plan. The returned
+// plan is untrusted until deterministic local policy accepts it.
+const DefaultSystemPrompt = `Return one valid JSON object.
+Fields: approved, reason, exec_type.
+For native execution add: "native":{"command":"...","args":["..."]}.
+For Codex execution add: "codex":{"prompt":"..."}.
+Use approved=false when no execution should occur. Keep reason brief. Return JSON only.`
 
-// Gatekeeper defines the interface for evaluating incoming intent.
-type Gatekeeper interface {
+// Planner translates incoming intent into a structured, untrusted plan.
+type Planner interface {
 	Evaluate(ctx context.Context, intent string, extraContext string) (Decision, error)
 }
 
-// LLMGatekeeper implements Gatekeeper using an OpenAI-compatible endpoint.
+// Gatekeeper is kept as a compatibility alias. Authorization is enforced by
+// deterministic local policy, not by this model interface.
+type Gatekeeper = Planner
+
+// LLMGatekeeper implements Planner using an OpenAI-compatible endpoint.
 type LLMGatekeeper struct {
 	cfg        Config
 	httpClient *http.Client
@@ -98,6 +220,18 @@ func (b *circuitBreaker) allow(now time.Time) bool {
 	return true
 }
 
+func (b *circuitBreaker) retryAfter(now time.Time) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if now.Before(b.openUntil) {
+		return b.openUntil.Sub(now)
+	}
+	if b.halfOpen {
+		return time.Second
+	}
+	return 0
+}
+
 func (b *circuitBreaker) success() {
 	b.mu.Lock()
 	b.failures = 0
@@ -136,6 +270,9 @@ func New(cfg Config) *LLMGatekeeper {
 	}
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = DefaultSystemPrompt
+	}
+	if cfg.UserAgent == "" {
+		cfg.UserAgent = "gpt-go-agent"
 	}
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 3
@@ -179,6 +316,21 @@ type openAIChatResponse struct {
 	} `json:"error,omitempty"`
 }
 
+type CircuitOpenError struct {
+	RetryAfterDuration time.Duration
+}
+
+func (e *CircuitOpenError) Error() string {
+	return "middleman circuit breaker is open"
+}
+
+func (e *CircuitOpenError) RetryAfter() time.Duration {
+	if e.RetryAfterDuration <= 0 {
+		return time.Second
+	}
+	return e.RetryAfterDuration
+}
+
 type statusError struct {
 	status int
 	body   string
@@ -192,12 +344,26 @@ func IsRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
+	var circuitErr *CircuitOpenError
+	if errors.As(err, &circuitErr) {
+		return true
+	}
 	var se *statusError
 	if errors.As(err, &se) {
 		return se.status == http.StatusTooManyRequests || se.status >= 500
 	}
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+func RetryDelay(err error, fallback time.Duration) time.Duration {
+	var retryAfter interface{ RetryAfter() time.Duration }
+	if errors.As(err, &retryAfter) {
+		if delay := retryAfter.RetryAfter(); delay > fallback {
+			return delay
+		}
+	}
+	return fallback
 }
 
 func (g *LLMGatekeeper) Evaluate(ctx context.Context, intent string, extraContext string) (Decision, error) {
@@ -210,12 +376,13 @@ func (g *LLMGatekeeper) Evaluate(ctx context.Context, intent string, extraContex
 	g.statsMu.Unlock()
 
 	for attempt := 1; attempt <= g.cfg.MaxAttempts; attempt++ {
-		if !g.breaker.allow(time.Now()) {
+		now := time.Now()
+		if !g.breaker.allow(now) {
 			g.statsMu.Lock()
 			g.stats.Failures++
 			g.stats.LastLatencyMs = time.Since(started).Milliseconds()
 			g.statsMu.Unlock()
-			return Decision{}, errors.New("middleman circuit breaker is open")
+			return Decision{}, &CircuitOpenError{RetryAfterDuration: g.breaker.retryAfter(now)}
 		}
 
 		dec, err := g.evaluateOnce(ctx, intent, extraContext)
@@ -277,9 +444,11 @@ func (g *LLMGatekeeper) evaluateOnce(ctx context.Context, intent string, extraCo
 		return Decision{}, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("User-Agent", "opencode/1.0")
-	httpReq.Header.Set("originator", "opencode")
-	httpReq.Header.Set("version", "1.0")
+	httpReq.Header.Set("User-Agent", g.cfg.UserAgent)
+	if strings.EqualFold(g.cfg.CompatibilityProfile, "opencode") {
+		httpReq.Header.Set("originator", "opencode")
+		httpReq.Header.Set("version", "1.0")
+	}
 	if g.cfg.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+g.cfg.APIKey)
 	}
@@ -335,20 +504,6 @@ func ParseDecisionJSON(raw string) (Decision, error) {
 	var d Decision
 	if err := json.Unmarshal([]byte(clean), &d); err != nil {
 		return Decision{}, fmt.Errorf("invalid json decision (%w): %s", err, clean)
-	}
-	if d.ExecType != "" && d.ExecType != "native" && d.ExecType != "codex" {
-		return Decision{}, fmt.Errorf("invalid exec_type %q", d.ExecType)
-	}
-	if len(d.Command) > 256 {
-		return Decision{}, errors.New("decision command too long")
-	}
-	if len(d.Args) > 32 {
-		return Decision{}, errors.New("too many decision args")
-	}
-	for _, arg := range d.Args {
-		if len(arg) > 4096 {
-			return Decision{}, errors.New("decision argument too long")
-		}
 	}
 	return d, nil
 }

@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -40,15 +43,27 @@ func (m *mockExecutor) ExecuteCodex(ctx context.Context, prompt string, targetDi
 	return "mock codex output", nil
 }
 
+func mustWorker(t *testing.T, gk middleman.Gatekeeper, exec Executor, cfg Config) *Worker {
+	t.Helper()
+	w, err := NewWorker(gk, exec, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+func nativeDecision(command string, args ...string) middleman.Decision {
+	return middleman.Decision{
+		Approved: true,
+		ExecType: middleman.ExecNative,
+		Native:   &middleman.NativePlan{Command: command, Args: args},
+	}
+}
+
 func TestWorker_NativeExecutionPipeline(t *testing.T) {
 	gk := &mockGatekeeper{
 		fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
-			return middleman.Decision{
-				Approved: true,
-				ExecType: "native",
-				Command:  "echo",
-				Args:     []string{"hello", "world"},
-			}, nil
+			return nativeDecision("echo", "hello", "world"), nil
 		},
 	}
 	exec := &mockExecutor{
@@ -57,7 +72,7 @@ func TestWorker_NativeExecutionPipeline(t *testing.T) {
 		},
 	}
 
-	w := NewWorker(gk, exec, Config{Workers: 1})
+	w := mustWorker(t, gk, exec, Config{Workers: 1})
 	defer w.Close()
 
 	job, err := w.Enqueue("print hello world", "test-context")
@@ -98,7 +113,7 @@ func TestWorker_PolicyRejectionPipeline(t *testing.T) {
 	}
 	exec := &mockExecutor{}
 
-	w := NewWorker(gk, exec, Config{Workers: 1})
+	w := mustWorker(t, gk, exec, Config{Workers: 1})
 	defer w.Close()
 
 	job, err := w.Enqueue("rm -rf /", "")
@@ -127,11 +142,7 @@ func TestWorker_PolicyRejectionPipeline(t *testing.T) {
 func TestWorker_HTTPHandler(t *testing.T) {
 	gk := &mockGatekeeper{
 		fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
-			return middleman.Decision{
-				Approved: true,
-				ExecType: "native",
-				Command:  "uptime",
-			}, nil
+			return nativeDecision("uptime"), nil
 		},
 	}
 	exec := &mockExecutor{
@@ -140,7 +151,7 @@ func TestWorker_HTTPHandler(t *testing.T) {
 		},
 	}
 
-	w := NewWorker(gk, exec, Config{Workers: 1})
+	w := mustWorker(t, gk, exec, Config{Workers: 1})
 	defer w.Close()
 
 	handler := w.Handler()
@@ -214,13 +225,13 @@ func TestValidateNativeCommand(t *testing.T) {
 func TestWorker_DeterministicNativeGate(t *testing.T) {
 	runCount := 0
 	gk := &mockGatekeeper{fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
-		return middleman.Decision{Approved: true, ExecType: "native", Command: "python3", Args: []string{"-c", "print('blocked')"}}, nil
+		return nativeDecision("python3", "-c", "print('blocked')"), nil
 	}}
 	exec := &mockExecutor{nativeFn: func(ctx context.Context, command string, args []string) (string, error) {
 		runCount++
 		return "should-not-run", nil
 	}}
-	w := NewWorker(gk, exec, Config{Workers: 1})
+	w := mustWorker(t, gk, exec, Config{Workers: 1})
 	defer w.Close()
 	job, err := w.Enqueue("run code", "")
 	if err != nil {
@@ -248,12 +259,12 @@ func TestWorker_DeterministicNativeGate(t *testing.T) {
 
 func TestWebhookAuthentication(t *testing.T) {
 	gk := &mockGatekeeper{fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
-		return middleman.Decision{Approved: true, ExecType: "native", Command: "echo", Args: []string{"AUTH_OK"}}, nil
+		return nativeDecision("echo", "AUTH_OK"), nil
 	}}
 	exec := &mockExecutor{nativeFn: func(ctx context.Context, command string, args []string) (string, error) {
 		return "AUTH_OK", nil
 	}}
-	w := NewWorker(gk, exec, Config{Workers: 1, WebhookSecret: "test-secret", RequireWebhookAuth: true})
+	w := mustWorker(t, gk, exec, Config{Workers: 1, WebhookSecret: "test-secret", RequireWebhookAuth: true})
 	defer w.Close()
 
 	h := w.Handler()
@@ -283,9 +294,9 @@ func TestWebhookAuthentication(t *testing.T) {
 
 func TestWebhookIdempotency(t *testing.T) {
 	gk := &mockGatekeeper{fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
-		return middleman.Decision{Approved: true, ExecType: "native", Command: "echo", Args: []string{"OK"}}, nil
+		return nativeDecision("echo", "OK"), nil
 	}}
-	w := NewWorker(gk, &mockExecutor{}, Config{Workers: 1})
+	w := mustWorker(t, gk, &mockExecutor{}, Config{Workers: 1})
 	defer w.Close()
 	h := w.Handler()
 	body := bytes.NewBufferString(`{"intent":"same"}`)
@@ -335,9 +346,9 @@ func TestRequestLimiter(t *testing.T) {
 
 func TestWebhookIdempotencyConflict(t *testing.T) {
 	gk := &mockGatekeeper{fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
-		return middleman.Decision{Approved: true, ExecType: "native", Command: "echo", Args: []string{"OK"}}, nil
+		return nativeDecision("echo", "OK"), nil
 	}}
-	w := NewWorker(gk, &mockExecutor{}, Config{Workers: 1})
+	w := mustWorker(t, gk, &mockExecutor{}, Config{Workers: 1})
 	defer w.Close()
 	h := w.Handler()
 	first := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"intent":"one"}`))
@@ -369,14 +380,14 @@ func TestWorkerRetriesOnlyGatekeeperFailures(t *testing.T) {
 		if calls < 2 {
 			return middleman.Decision{}, retryableTestError{}
 		}
-		return middleman.Decision{Approved: true, ExecType: "native", Command: "echo", Args: []string{"OK"}}, nil
+		return nativeDecision("echo", "OK"), nil
 	}}
 	execCalls := 0
 	exec := &mockExecutor{nativeFn: func(ctx context.Context, command string, args []string) (string, error) {
 		execCalls++
 		return "OK", nil
 	}}
-	w := NewWorker(gk, exec, Config{Workers: 1, MaxGatekeeperRetries: 2, RetryBaseDelay: time.Millisecond})
+	w := mustWorker(t, gk, exec, Config{Workers: 1, MaxGatekeeperRetries: 2, RetryBaseDelay: time.Millisecond})
 	defer w.Close()
 	job, err := w.Enqueue("retry", "")
 	if err != nil {
@@ -399,7 +410,7 @@ func TestWorkerDeadLettersFinalGatekeeperFailure(t *testing.T) {
 	gk := &mockGatekeeper{fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
 		return middleman.Decision{}, retryableTestError{}
 	}}
-	w := NewWorker(gk, &mockExecutor{}, Config{Workers: 1, MaxGatekeeperRetries: 1, RetryBaseDelay: time.Millisecond})
+	w := mustWorker(t, gk, &mockExecutor{}, Config{Workers: 1, MaxGatekeeperRetries: 1, RetryBaseDelay: time.Millisecond})
 	defer w.Close()
 	job, err := w.Enqueue("dead", "")
 	if err != nil {
@@ -422,7 +433,7 @@ func TestListJobsPagination(t *testing.T) {
 	gk := &mockGatekeeper{fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
 		return middleman.Decision{Approved: false, Reason: "test"}, nil
 	}}
-	w := NewWorker(gk, &mockExecutor{}, Config{Workers: 1})
+	w := mustWorker(t, gk, &mockExecutor{}, Config{Workers: 1})
 	defer w.Close()
 	for i := 0; i < 3; i++ {
 		if _, err := w.Enqueue("job", ""); err != nil {
@@ -441,5 +452,64 @@ func TestBoundedBufferCapsOutput(t *testing.T) {
 	_, _ = b.Write([]byte("abcdefgh"))
 	if got := b.String(); !strings.Contains(got, "abcd") || !strings.Contains(got, "output truncated") {
 		t.Fatalf("unexpected bounded output %q", got)
+	}
+}
+
+func TestDefaultExecutorCodexPolicy(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-codex")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	disabled := &DefaultExecutor{Workspace: dir, CodexBin: bin}
+	if _, err := disabled.ExecuteCodex(context.Background(), "inspect", ""); err == nil {
+		t.Fatal("expected codex disabled error")
+	}
+
+	readOnly := &DefaultExecutor{Workspace: dir, CodexBin: bin, CodexEnabled: true}
+	out, err := readOnly.ExecuteCodex(context.Background(), "inspect", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "--sandbox\nread-only") {
+		t.Fatalf("expected read-only sandbox, got %q", out)
+	}
+
+	write := &DefaultExecutor{Workspace: dir, CodexBin: bin, CodexEnabled: true, CodexAllowWrite: true}
+	out, err = write.ExecuteCodex(context.Background(), "inspect", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "--sandbox\nworkspace-write") {
+		t.Fatalf("expected workspace-write sandbox, got %q", out)
+	}
+}
+
+func TestWorkerMaxJobsBackpressure(t *testing.T) {
+	gk := &mockGatekeeper{fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
+		return middleman.Decision{Approved: false, Reason: "test"}, nil
+	}}
+	w := mustWorker(t, gk, &mockExecutor{}, Config{Workers: 1, MaxJobs: 1})
+	defer w.Close()
+
+	if _, err := w.Enqueue("one", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Enqueue("two", ""); !errors.Is(err, ErrJobCapacity) {
+		t.Fatalf("expected capacity error, got %v", err)
+	}
+}
+
+func TestNewWorkerReturnsStoreLoadError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.json")
+	if err := os.WriteFile(path, []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gk := &mockGatekeeper{fn: func(ctx context.Context, intent string, extraContext string) (middleman.Decision, error) {
+		return middleman.Decision{}, nil
+	}}
+	if _, err := NewWorker(gk, &mockExecutor{}, Config{Store: NewJobStore(path)}); err == nil {
+		t.Fatal("expected store load error")
 	}
 }

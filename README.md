@@ -1,35 +1,48 @@
 # gpt-go-agent
 
-A self-hosted execution gateway for ChatGPT-compatible MCP clients.
+A self-hosted execution gateway for ChatGPT-compatible MCP clients, with an optional durable webhook-to-planner execution pipeline.
 
-The daemon does not run an LLM and does not depend on Codex quotas. It exposes a small, authenticated MCP tool surface that a connected ChatGPT/MCP client can call against a user-controlled workspace.
+The core daemon does not contain a reasoning model. MCP clients call a small local tool surface against a user-controlled workspace. The optional webhook path can ask an OpenAI-compatible Middleman service to translate an intent into a typed execution decision, but deterministic local policy remains the final execution gate.
 
 ## Architecture
 
     ChatGPT / MCP client
             |
-            | Streamable HTTP / MCP
+            | POST /mcp
             v
       gpt-go-agent
             |
-            +-- authentication
-            +-- workspace boundary
-            +-- write policy
-            +-- command allowlist
+            +-- bearer authentication
+            +-- capability-rooted workspace
+            +-- explicit write policy
+            +-- strict/trusted command policy
             +-- audit log
             |
             v
-     user-controlled VPS/workspace
+     user-controlled workspace
 
-The model/reasoning layer remains outside this process. gpt-go-agent is the execution boundary.
+Optional webhook path:
+
+    authenticated caller
+            |
+            | POST /webhook
+            v
+       durable queue
+            |
+            v
+       Middleman planner
+            |
+            v
+     deterministic policy
+        |          |
+      native      Codex
+        |          |
+     strict     read-only by default
+      gate      workspace-write opt-in
 
 ## MCP endpoint
 
-The server exposes:
-
-    POST /mcp
-
-It implements the MCP JSON-RPC methods needed for tool discovery and invocation:
+The server exposes POST /mcp and implements the JSON-RPC methods currently required by the supported MCP client flow:
 
     initialize
     notifications/initialized
@@ -45,120 +58,156 @@ Current tools:
 
 ## Security model
 
-- Workspace paths must remain inside the configured workspace.
-- Absolute paths are rejected.
-- Parent traversal outside the workspace is rejected.
-- Write access is disabled by default.
-- Command execution is disabled by default.
-- Executables must be explicitly allowlisted.
-- Command execution uses argument arrays, not a shell command string.
-- Command timeout and output size are bounded.
-- Remote MCP requests require a bearer token.
-- Without a token, MCP is accepted only from loopback.
-- The MCP token and OpenAI credentials are not inherited by child commands.
-- Tool calls are recorded in the append-only 0600 audit log.
-- The daemon does not expose an unauthenticated raw network shell.
+Filesystem access is rooted with Go os.Root. Relative-path validation is not the only boundary: read, list, write, and command working-directory resolution reject symlink traversal outside the configured workspace.
 
-## Configuration
+Write access is disabled by default.
 
-See deploy/env.example.
+Command execution is disabled by default and has two modes:
 
-Important settings:
+- strict: the default. Only a small deterministic diagnostic surface is permitted: echo, uptime, pwd, date, uname, id, and ls, with constrained arguments.
+- trusted: requires both AGENT_ALLOW_COMMAND_EXEC=1 and an explicit AGENT_ALLOWED_COMMANDS list. Trusted mode intentionally grants an allowlisted executable the authority of the gpt-go-agent service account. An executable-name allowlist is not a sandbox.
 
-    AGENT_MCP_TOKEN
-    AGENT_LISTEN_ADDR
-    AGENT_WORKSPACE
-    AGENT_ALLOW_WRITE
-    AGENT_ALLOW_COMMAND_EXEC
-    AGENT_ALLOWED_COMMANDS
-    AGENT_AUDIT_PATH
+When MCP write or command execution is enabled, AGENT_MCP_TOKEN is mandatory. A non-loopback listener also requires AGENT_MCP_TOKEN.
 
-Start locally:
+Child process output and execution time are bounded. Strict native commands receive a minimal environment. Trusted subprocesses and Codex receive a credential-sanitized environment.
+
+The optional Codex executor is disabled by default. When enabled it uses a read-only sandbox unless AGENT_CODEX_ALLOW_WRITE=1 is explicitly set.
+
+The systemd unit provides defense in depth with a dedicated account, NoNewPrivileges, filesystem protection, empty capability sets, namespace restrictions, and other hardening. Application-level policy remains the primary boundary.
+
+## Core configuration
+
+    AGENT_LISTEN_ADDR=127.0.0.1:8787
+    AGENT_WORKSPACE=/var/lib/gpt-go-agent/workspace
+    AGENT_MCP_TOKEN=
+
+    AGENT_ALLOW_WRITE=0
+    AGENT_ALLOW_COMMAND_EXEC=0
+    AGENT_COMMAND_EXEC_MODE=strict
+    AGENT_ALLOWED_COMMANDS=
+
+    AGENT_COMMAND_TIMEOUT=60s
+    AGENT_MCP_MAX_OUTPUT_BYTES=16384
+    AGENT_AUDIT_PATH=/var/lib/gpt-go-agent/agent-audit.jsonl
+
+Read-only local start:
 
     export AGENT_WORKSPACE=/var/lib/gpt-go-agent/workspace
-    export AGENT_MCP_TOKEN='use-a-long-random-secret'
     go run ./cmd/gpt-go-agent
 
-For command execution:
+Enable writes:
 
-    export AGENT_ALLOW_COMMAND_EXEC=1
-    export AGENT_ALLOWED_COMMANDS='git go python3 npm node make ls pwd cat grep find'
-
-Enable writes separately:
-
+    export AGENT_MCP_TOKEN='use-a-long-random-secret'
     export AGENT_ALLOW_WRITE=1
 
-Do not expose the service publicly without authentication and TLS/tunneling.
+Strict command execution:
 
-## Connecting to ChatGPT
+    export AGENT_MCP_TOKEN='use-a-long-random-secret'
+    export AGENT_ALLOW_COMMAND_EXEC=1
+    export AGENT_COMMAND_EXEC_MODE=strict
 
-OpenAI documents custom MCP servers as a way for ChatGPT-compatible products to call tools on infrastructure you operate. ChatGPT connects to remote MCP servers; private/local servers can be reached through Secure MCP Tunnel rather than being exposed directly to the public internet.
+Trusted command execution is an explicit authority escalation:
 
-The exact availability of write-capable custom MCP apps depends on the ChatGPT product/workspace and its current developer-mode/app permissions.
+    export AGENT_MCP_TOKEN='use-a-long-random-secret'
+    export AGENT_ALLOW_COMMAND_EXEC=1
+    export AGENT_COMMAND_EXEC_MODE=trusted
+    export AGENT_ALLOWED_COMMANDS='git go'
 
-Recommended deployment path:
+In trusted mode, tools such as interpreters, build systems, package managers, and VCS clients may provide general code execution under the service account. Enable only when that is the intended trust model.
 
-    VPS
-      |
-      +-- gpt-go-agent
-      |
-      +-- private MCP endpoint
-              |
-              +-- Secure MCP Tunnel
-              |
-              +-- ChatGPT
+## Optional webhook pipeline
 
-This keeps the execution service independent from Codex.
+Webhook support is disabled unless AGENT_WEBHOOK_ENABLED=1 is set. Pure MCP deployments do not need a webhook token, Middleman service, durable job store, or Codex installation.
 
-## Operational hardening
+Enable webhook mode:
 
-The systemd unit uses a dedicated service account and filesystem restrictions. Keep the workspace and audit/state directories under the service-owned data directory.
+    AGENT_WEBHOOK_ENABLED=1
+    AGENT_WEBHOOK_TOKEN=use-a-separate-long-random-secret
+    AGENT_MIDDLEMAN_URL=http://127.0.0.1:20128/v1
+    AGENT_MIDDLEMAN_MODEL=glm-5.3
+    AGENT_MIDDLEMAN_COMPAT_PROFILE=
 
-Before enabling command execution, start with read-only tools and validate the MCP connection. Enable writes and command execution deliberately.
+For compatibility, OPENAI_WEBHOOK_SECRET is accepted as a fallback token, but AGENT_WEBHOOK_TOKEN is the preferred name because this endpoint uses bearer authentication rather than vendor webhook-signature verification.
 
-## Tests
-
-CI runs:
-
-    go test ./...
-    go test -race ./...
-    go vet ./...
-    go build ./...
-
-The goal is that all execution happens through the bounded MCP tool surface rather than through a second agent runtime embedded in this daemon.
-
-## Webhook execution pipeline
-
-The durable webhook path exposes:
+Endpoints:
 
     POST /webhook
     GET  /webhook?limit=50&offset=0
     GET  /webhook/{id}
 
-Webhook POSTs require the configured bearer secret. `Idempotency-Key` prevents duplicate delivery from creating duplicate jobs; reusing a key with different request content returns HTTP 409. `X-Request-ID` can supply a correlation ID and is echoed in the response.
+Webhook POST supports Idempotency-Key and X-Request-ID. Reusing an idempotency key with different request content returns HTTP 409.
 
-The worker persists state transitions atomically, keeps a backup store, recovers pending jobs after restart, dead-letters terminal operational failures, retries transient Middleman failures with bounded backoff, and prunes terminal jobs after the configured retention period.
+Job state is persisted before execution-side effects are allowed. Store health contributes to /readyz. Pending jobs are recovered after restart; jobs that were evaluating or running at restart are terminally failed for manual review.
 
-Native execution has a deterministic allowlist. Codex execution is sandboxed to workspace-write, child environments are sanitized, and subprocess output is bounded.
+The JSON durable store is intentionally bounded with AGENT_WEBHOOK_MAX_JOBS. It is suitable for a small single-node gateway, not an unbounded high-throughput queue.
 
-Metrics are exposed from `/metrics`, including queue depth, job lifecycle counts, retries, dead letters, execution latency, and Middleman retry/circuit statistics.
+Webhook tuning:
 
-## Resilience configuration
+    AGENT_WEBHOOK_WORKERS=4
+    AGENT_WEBHOOK_QUEUE_SIZE=100
+    AGENT_WEBHOOK_MAX_JOBS=10000
+    AGENT_WEBHOOK_RATE_LIMIT_PER_MINUTE=120
+    AGENT_WEBHOOK_JOB_TIMEOUT=3m
+    AGENT_WEBHOOK_RETENTION=168h
+    AGENT_WEBHOOK_CLEANUP_INTERVAL=1h
+    AGENT_WEBHOOK_MAX_OUTPUT_BYTES=65536
 
-    AGENT_MIDDLEMAN_MAX_ATTEMPTS
-    AGENT_MIDDLEMAN_RETRY_BASE
-    AGENT_MIDDLEMAN_CIRCUIT_THRESHOLD
-    AGENT_MIDDLEMAN_CIRCUIT_OPEN
-    AGENT_WEBHOOK_RETENTION
-    AGENT_WEBHOOK_CLEANUP_INTERVAL
-    AGENT_WEBHOOK_MAX_GATEKEEPER_RETRIES
-    AGENT_WEBHOOK_RETRY_BASE
-    AGENT_WEBHOOK_MAX_OUTPUT_BYTES
+The default Middleman User-Agent identifies gpt-go-agent. Set AGENT_MIDDLEMAN_COMPAT_PROFILE=opencode only for an upstream router that explicitly requires the legacy OpenCode compatibility headers.
 
-See `deploy/env.example` for defaults.
+Middleman transport resilience:
 
-## Release and deployment
+    AGENT_MIDDLEMAN_TIMEOUT=30s
+    AGENT_MIDDLEMAN_MAX_ATTEMPTS=3
+    AGENT_MIDDLEMAN_RETRY_BASE=250ms
+    AGENT_MIDDLEMAN_CIRCUIT_THRESHOLD=3
+    AGENT_MIDDLEMAN_CIRCUIT_OPEN=10s
 
-Release tags use `vMAJOR.MINOR.PATCH`. The release workflow builds Linux amd64/arm64 artifacts and SHA256 checksums. `scripts/deploy.sh` performs an atomic binary replacement, restarts the service, verifies health/readiness, and restores the previous binary on failed deployment checks.
+Worker-level Gatekeeper retries default to zero because the Middleman transport already retries transient failures. If enabled, circuit-open errors carry a retry delay so the worker does not immediately retry into an open breaker.
 
-The repository CI gate runs tests, race detection, vet, coverage, build, Staticcheck, Gosec, and govulncheck.
+## Optional Codex execution
+
+Codex is independent from MCP write permission:
+
+    AGENT_CODEX_ENABLED=0
+    AGENT_CODEX_ALLOW_WRITE=0
+    AGENT_CODEX_BIN=codex
+
+AGENT_CODEX_ENABLED=1 allows approved webhook plans to invoke Codex. The default sandbox remains read-only. Set AGENT_CODEX_ALLOW_WRITE=1 only when workspace mutation by Codex is intended.
+
+## Observability
+
+The daemon exposes:
+
+    GET /healthz
+    GET /readyz
+    GET /metrics
+
+Audit events are JSONL with a real UTC timestamp, action, target, decision, correlation ID where available, and duration. The audit file is created with mode 0600.
+
+Webhook metrics include queue/capacity, retained job counts by state, storage health, worker count, retry/dead-letter counts, maximum retained job duration, and Middleman retry/circuit metrics.
+
+## Tests and CI
+
+The project requires Go 1.25+ and pins the production/CI toolchain to Go 1.25.14 or newer patched releases.
+
+CI runs:
+
+    gofmt check
+    go test ./...
+    go test -race ./...
+    go vet ./...
+    go test -cover ./...
+    go build ./...
+    Staticcheck
+    Gosec
+    govulncheck
+
+Security regression tests include workspace traversal and symlink-escape cases, strict/trusted execution policy, bearer authentication, webhook idempotency, output bounds, retry behavior, durable-store backup recovery, and restart recovery.
+
+## Deployment
+
+Release tags use vMAJOR.MINOR.PATCH. The release workflow builds Linux amd64 and arm64 binaries with checksums.
+
+scripts/deploy.sh performs an atomic binary replacement, restarts the service, checks /healthz and /readyz, and restores the previous binary if deployment health checks fail.
+
+Keep the service private whenever possible. Prefer a private tunnel or trusted reverse proxy rather than directly exposing the execution service to the public internet.
