@@ -16,16 +16,24 @@ type Event struct {
 	CorrelationID string    `json:"correlation_id,omitempty"`
 	DurationMS    int64     `json:"duration_ms,omitempty"`
 }
+
 type Logger struct {
 	mu   sync.Mutex
 	path string
 }
 
 func New(path string) *Logger { return &Logger{path: path} }
+
 func (l *Logger) Record(e Event) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	e.Time = e.Time.UTC()
+
+	if e.Time.IsZero() {
+		e.Time = time.Now().UTC()
+	} else {
+		e.Time = e.Time.UTC()
+	}
+
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
