@@ -184,7 +184,7 @@ func getenvInt(name string, fallback int) int {
 		return fallback
 	}
 	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
+	if err != nil {
 		return fallback
 	}
 	return n
