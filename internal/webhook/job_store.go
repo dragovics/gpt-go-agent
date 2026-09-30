@@ -3,6 +3,7 @@ package webhook
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,31 +21,43 @@ func NewJobStore(path string) *JobStore {
 	return &JobStore{path: path, jobs: make(map[string]Job)}
 }
 
-func (s *JobStore) Load() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	data, err := os.ReadFile(s.path)
-	if os.IsNotExist(err) {
-		return nil
-	}
+func decodeJobStore(path string) (map[string]Job, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var jobs map[string]Job
 	if err := json.Unmarshal(data, &jobs); err != nil {
-		backup, backupErr := os.ReadFile(s.path + ".bak")
-		if backupErr != nil {
-			return err
-		}
-		if backupErr = json.Unmarshal(backup, &jobs); backupErr != nil {
-			return err
-		}
+		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
 	if jobs == nil {
 		jobs = make(map[string]Job)
 	}
-	s.jobs = jobs
-	return nil
+	return jobs, nil
+}
+
+func (s *JobStore) Load() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	jobs, primaryErr := decodeJobStore(s.path)
+	if primaryErr == nil {
+		s.jobs = jobs
+		return nil
+	}
+
+	backupPath := s.path + ".bak"
+	backup, backupErr := decodeJobStore(backupPath)
+	if backupErr == nil {
+		s.jobs = backup
+		return nil
+	}
+
+	if os.IsNotExist(primaryErr) && os.IsNotExist(backupErr) {
+		s.jobs = make(map[string]Job)
+		return nil
+	}
+	return fmt.Errorf("load job store failed: primary: %v; backup: %v", primaryErr, backupErr)
 }
 
 func (s *JobStore) Put(job Job) error {
