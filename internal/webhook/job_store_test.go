@@ -105,3 +105,27 @@ func TestJobStorePruneBefore(t *testing.T) {
 		t.Fatalf("remaining=%#v", jobs)
 	}
 }
+
+
+func TestJobStoreLoadsBackupWhenPrimaryMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.json")
+	store := NewJobStore(path)
+	if err := store.Put(Job{ID: "j1", Intent: "first", Status: StatusCompleted, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(Job{ID: "j2", Intent: "second", Status: StatusCompleted, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := NewJobStore(path)
+	if err := loaded.Load(); err != nil {
+		t.Fatalf("backup recovery failed: %v", err)
+	}
+	jobs := loaded.List()
+	if len(jobs) != 1 || jobs[0].ID != "j1" {
+		t.Fatalf("unexpected backup jobs: %#v", jobs)
+	}
+}
