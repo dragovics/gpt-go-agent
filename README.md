@@ -20,6 +20,7 @@ Proyek ini dirancang untuk orang yang ingin klien AI bekerja terhadap VPS privat
 - [Model keamanan](#model-keamanan)
 - [Kebutuhan](#kebutuhan)
 - [Mulai cepat: MCP-only](#mulai-cepat-mcp-only)
+- [Memilih profil deployment](#memilih-profil-deployment)
 - [Tool MCP](#tool-mcp)
 - [Menguji endpoint MCP secara manual](#menguji-endpoint-mcp-secara-manual)
 - [Mengaktifkan tulis](#mengaktifkan-tulis)
@@ -201,6 +202,72 @@ Perintah native tetap harus melewati kebijakan server-side deterministik sebelum
 | Endpoint health | aktif | `GET /healthz` |
 | Endpoint readiness | aktif | `GET /readyz` |
 | Endpoint metrics | aktif | `GET /metrics` |
+
+---
+
+## Memilih profil deployment
+
+Bagian ini membantu memilih konfigurasi minimum sesuai kebutuhan.
+
+### Profil minimal: MCP-only
+
+Hanya untuk inspeksi file workspace.
+
+Variabel minimum:
+
+```bash
+AGENT_WORKSPACE=/path/ke/workspace
+AGENT_LISTEN_ADDR=127.0.0.1:8787
+```
+
+Cocok untuk:
+
+- ChatGPT atau klien MCP yang hanya perlu membaca file di workspace privat
+- Tidak butuh tulis, tidak butuh eksekusi perintah
+
+### Profil menengah: tulis + eksekusi terbatas
+
+Untuk pengeditan file dan perintah diagnostik kecil.
+
+Variabel minimum:
+
+```bash
+AGENT_WORKSPACE=/path/ke/workspace
+AGENT_LISTEN_ADDR=127.0.0.1:8787
+AGENT_MCP_TOKEN='<random-hex-32>'
+AGENT_ALLOW_WRITE=1
+AGENT_ALLOW_COMMAND_EXEC=1
+AGENT_ALLOWED_COMMANDS='echo uptime pwd date uname id ls'
+```
+
+Cocok untuk:
+
+- Pengeditan terapeutik file (refactor, koreksi typo, tambah dokumentasi)
+- Diagnostik server sederhana tanpa shell penuh
+
+### Profil lengkap: webhook + Codex
+
+Untuk job asinkron dan delegasi coding.
+
+Variabel tambahan:
+
+```bash
+AGENT_WEBHOOK_ENABLED=1
+AGENT_WEBHOOK_TOKEN='<random-hex-32>'
+AGENT_MIDDLEMAN_URL=http://127.0.0.1:20128/v1
+AGENT_MIDDLEMAN_MODEL=glm-5.3
+AGENT_MIDDLEMAN_KEY='<...>'
+AGENT_CODEX_BIN=codex
+# AGENT_CODEX_ALLOW_WRITE=0  # biarkan read-only secara default
+```
+
+Cocok untuk:
+
+- Antrian job durable dengan retry dan circuit-breaker
+- Middleman menerjemahkan intent menjadi rencana eksekusi deterministik
+- Codex CLI sebagai eksekutor untuk job coding dengan sandbox read-only
+
+Prinsipnya: aktifkan kapabilitas hanya jika dipakai, dan selalu gunakan allowlist sekecil mungkin. Mode MCP-only tetap default sampai Anda secara eksplisit membutuhkan webhook atau Codex.
 
 ---
 
@@ -1680,3 +1747,14 @@ Jika kapabilitas tambahan dibutuhkan, lebih memilih menambah **tool bertipe semp
 ## Lisensi / kepemilikan
 
 Repositori ini saat ini dikelola sebagai proyek privat. Tambahkan lisensi eksplisit sebelum mendistribusikannya secara publik.
+
+---
+
+## Tentang terjemahan ini
+
+Versi Bahasa Indonesia ini adalah terjemahan manual dari README asli (`README.en.md` atau default branch).
+
+- **Tujuan**: membantu deployment dan audit oleh operator Indonesia yang lebih nyaman membaca dokumentasi dalam Bahasa Indonesia.
+- **Konsistensi**: istilah teknis (nama env var, nama executable, nama endpoint, nama modul Go, nama protokol) tetap memakai bentuk aslinya dalam English. Bagian naratif, instruksi, dan rekomendasi diterjemahkan utuh.
+- **Sinkronisasi**: terjemahan diperbarui ketika README sumber berubah. Karena README sumber ditulis tangan dalam English, terjemahan ini bukan hasil terjemahan otomatis, jadi beberapa kalimat mungkin tertinggal setelah perubahan upstream.
+- **Kontributor**: kalau Anda menemukan ketidaksesuaian antara README Bahasa Indonesia dan perilakunya, mohon perbaiki dari README sumber (English) terlebih dahulu, kemudian perbarui terjemahan.
