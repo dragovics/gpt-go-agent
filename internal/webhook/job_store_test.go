@@ -106,7 +106,6 @@ func TestJobStorePruneBefore(t *testing.T) {
 	}
 }
 
-
 func TestJobStoreLoadsBackupWhenPrimaryMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "jobs.json")
 	store := NewJobStore(path)
