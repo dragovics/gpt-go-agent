@@ -37,6 +37,7 @@ Proyek ini dirancang untuk orang yang ingin klien AI bekerja terhadap VPS privat
 - [Troubleshooting](#troubleshooting)
 - [Rekomendasi operasional](#rekomendasi-operasional)
 - [Tindak lanjut arsitektur yang diketahui](#tindak-lanjut-arsitektur-yang-diketahui)
+- [Ekosistem & integrasi](#ekosistem--integrasi)
 
 ---
 
@@ -117,61 +118,77 @@ Misalnya, menambahkan `python3` ke `AGENT_ALLOWED_COMMANDS` **tidak** membuat `p
 
 ### Jalur MCP
 
+Diagram berikut merangkum satu permintaan MCP dari klien ke host terkontrol. Batas eksekusi berada di dalam kotak `gpt-go-agent`; klien dan host tidak pernah berkomunikasi langsung.
+
+```mermaid
+flowchart LR
+    A["Klien ChatGPT / MCP"] -- "POST /mcp<br/>+ bearer token" --> B["gpt-go-agent"]
+    B -- "filesystem ter-root<br/>+ audit JSONL" --> C["Host terkontrol<br/>(workspace)"]
+```
+
+Representasi ASCII ekuivalen (untuk pembaca terminal):
+
 ```text
 Klien ChatGPT / MCP
         |
-        | POST /mcp
+        | POST /mcp + bearer token
         v
-+-------------------------+
-|      gpt-go-agent       |
-|-------------------------|
-| Autentikasi bearer      |
-| Workspace ter-root      |
-| Kapabilitas baca/tulis  |
-| Kebijakan cmd terbatas  |
-| Batas timeout/output    |
-| Sanitasi environment    |
-| Audit logging           |
-+------------+------------+
-             |
-             v
-       host terkontrol
+  gpt-go-agent
+  ├─ autentikasi bearer
+  ├─ workspace ter-root
+  ├─ kapabilitas baca/tulis
+  ├─ kebijakan cmd terbatas
+  ├─ batas timeout/output
+  ├─ sanitasi environment
+  └─ audit logging
+        |
+        v
+  Host terkontrol (workspace)
 ```
 
 Operasi file MCP dilakukan melalui API filesystem ter-root milik Go. Ini mencegah sebuah path atau symlink di dalam workspace secara transparan ter-resolve ke luar root yang dikonfigurasi.
 
 ### Jalur webhook opsional
 
+Diagram ini menunjukkan alur job webhook: Middleman **bukan** otoritas keamanan final; output-nya adalah proposal, dan setiap cabang eksekusi harus melewati gate deterministik sebelum child process dibuat.
+
+```mermaid
+flowchart TD
+    A["Pemanggil webhook<br/>(bearer + Idempotency-Key)"] --> B["Durable job queue"]
+    B --> C["Middleware: Middleman planner<br/>(OpenAI-compatible API)"]
+    C --> D{"Eksekusi?"}
+    D -- "native" --> E["Kebijakan cmd deterministik"]
+    D -- "codex" --> F["Codex sandbox (read-only default)"]
+    E --> G["Workspace"]
+    F --> G
+```
+
+Representasi ASCII ekuivalen (untuk pembaca terminal):
+
 ```text
 Pemanggil webhook
       |
-      | Token bearer
-      | Idempotency-Key
+      | bearer + Idempotency-Key
       v
-+----------------------+
-| durable job queue    |
-+----------+-----------+
-           |
-           v
-+----------------------+
-| Middleman planner    |
-| OpenAI-compatible API|
-+----------+-----------+
-           |
-           v
-    execution decision
-       /          \
-      /            \
+Durable job queue
+      |
+      v
+Middleware: Middleman planner (OpenAI-compatible API)
+      |
+      v
+   Eksekusi decision
+      /          \
+     /            \
  native           codex
    |                |
    v                v
-deterministic     Codex sandbox
-command policy    read-only by default
+Kebijakan cmd    Codex sandbox
+deterministik    read-only default
    |                |
    +-------+--------+
            |
            v
-      workspace
+      Workspace
 ```
 
 Middleman **bukan** otoritas keamanan final. Output-nya diperlakukan sebagai proposal eksekusi.
@@ -1747,6 +1764,91 @@ Jika kapabilitas tambahan dibutuhkan, lebih memilih menambah **tool bertipe semp
 ## Lisensi / kepemilikan
 
 Repositori ini saat ini dikelola sebagai proyek privat. Tambahkan lisensi eksplisit sebelum mendistribusikannya secara publik.
+
+---
+
+## Ekosistem & integrasi
+
+`gpt-go-agent` bukan produk terisolasi — ia bekerja paling baik ketika dipasang berdampingan dengan komponen ekosistem yang sudah terbukti. Bagian ini merangkum integrasi yang umum dipakai di deployment nyata, dengan tautan ke dokumentasi resmi masing-masing.
+
+### Klien MCP & AI client
+
+- **[OpenAI: Custom MCP servers](https://platform.openai.com/docs/mcp)** — panduan resmi OpenAI untuk menghubungkan ChatGPT ke server MCP kustom lewat Apps SDK dan Connectors.
+- **[Anthropic: Model Context Protocol](https://docs.anthropic.com/en/docs/agents-and-tools/mcp)** — dokumentasi Anthropic untuk dukungan MCP di Claude, termasuk konektor dan server remote.
+- **[MCP specification](https://modelcontextprotocol.io/)** — spesifikasi terbuka Model Context Protocol, tempat endpoint `POST /mcp` dan method JSON-RPC didefinisikan.
+- **[MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk)** — SDK resmi Go untuk MCP. Direkomendasikan untuk transisi lapisan protokol dari implementasi tulisan tangan saat ini (lihat [Tindak lanjut arsitektur yang diketahui](#tindak-lanjut-arsitektur-yang-diketahui)).
+
+### Tunnel & akses jarak jauh
+
+Default daemon bind ke loopback (`127.0.0.1:8787`). Untuk akses MCP jarak jauh, gunakan salah satu:
+
+- **[Cloudflare Tunnel (`cloudflared`)](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)** — tunnel persisten tanpa membuka port publik. Cocok untuk deploy VPS atau homelab yang berada di belakang NAT.
+- **[Tailscale](https://tailscale.com/kb/)** — overlay WireGuard pribadi. Cocok untuk akses dari laptop/HP ke VPS tanpa expose publik.
+- **[SSH tunnel `ssh -L`](https://man.openbsd.org/ssh)** — opsi paling ringan untuk admin yang sudah punya akses SSH ke host. Contoh: `ssh -L 8787:127.0.0.1:8787 user@vps`.
+- **[ngrok](https://ngrok.com/docs)** — tunnel publik cepat untuk demo atau uji coba singkat. **Jangan dipakai untuk produksi tanpa autentikasi bearer.**
+
+### Middleman & inference gateway
+
+Mode webhook memakai endpoint OpenAI-compatible. Implementasi yang sudah dipakai di lapangan:
+
+- **[9Router](https://9router.com)** — router lokal multi-provider dengan namespace prefix (`ag/`, `cc/`, `cx/`, `gh/`, dst.). Bisa dijalankan sebagai Docker container di VPS yang sama dengan `gpt-go-agent`.
+- **[LiteLLM](https://docs.litellm.ai/)** — proxy OpenAI-compatible yang meneruskan ke banyak provider backend, mendukung fallback dan cost tracking.
+- **[OpenRouter](https://openrouter.ai/docs)** — hosted gateway untuk akses ke banyak model frontier lewat satu API key.
+
+### Prometheus & observability
+
+Endpoint `/metrics` memakai format Prometheus-text. Komponen monitoring yang umum:
+
+- **[Prometheus](https://prometheus.io/docs/)** — pull-based metrics scraper.
+- **[Grafana](https://grafana.com/docs/)** — visualisasi metrics dan dashboard untuk `gpt_go_agent_jobs_*`.
+- **[Alertmanager](https://prometheus.io/docs/alerting/latest/alertmanager/)** — alerting saat `gpt_go_agent_jobs_failed` atau `gpt_go_agent_queue_depth` melewati ambang.
+
+### Codex CLI
+
+Mode webhook dapat mendispatch job coding ke Codex CLI. Dokumentasi:
+
+- **[OpenAI: Codex CLI](https://github.com/openai/codex)** — repository Codex CLI. Konfigurasikan lewat `AGENT_CODEX_BIN` jika binary tidak di `PATH` service.
+- **[Codex sandbox modes](https://github.com/openai/codex#sandbox)** — referensi mode sandbox read-only dan workspace-write.
+
+### Topologi deployment umum
+
+```text
+ChatGPT (klien) ─── secure tunnel / private network ───► VPS
+                                                            │
+                                                            ├─ gpt-go-agent (127.0.0.1:8787)
+                                                            │     ├─ audit log → /var/lib/gpt-go-agent/agent-audit.jsonl
+                                                            │     ├─ job store → /var/lib/gpt-go-agent/jobs/store.json
+                                                            │     └─ workspace → /var/lib/gpt-go-agent/workspace/
+                                                            │
+                                                            └─ 9Router (127.0.0.1:20128)  ←── Middleman inference
+                                                                  ├─ upstream: OpenAI-compatible API
+                                                                  └─ model: AGENT_MIDDLEMAN_MODEL
+```
+
+Topologi ini mempertahankan invariant desain:
+
+- Klien tidak pernah berbicara langsung dengan host — semua permintaan melewati `gpt-go-agent` (audit + batas eksekusi).
+- Middleman tidak pernah menulis ke host tanpa melewati gate deterministik.
+- Audit log + job store adalah satu-satunya state persisten yang perlu di-backup.
+
+### Topologi deployment ringan (laptop / homelab)
+
+```text
+Laptop (ChatGPT client)
+   │
+   │  ssh -L 8787:127.0.0.1:8787 homelab
+   ▼
+Homelab / VPS (gpt-go-agent)
+   ├─ AGENT_WORKSPACE=/srv/projects/<nama>
+   ├─ 9Router (jika webhook mode diaktifkan)
+   └─ Codex CLI (jika delegasi coding dipakai)
+```
+
+Tanpa tunnel publik, tanpa port forwarding, tanpa firewall exposure — hanya SSH port yang sudah dibuka.
+
+---
+
+## Lisensi / kepemilikan
 
 ---
 
