@@ -1,150 +1,150 @@
 # gpt-go-agent
 
-A self-hosted execution gateway that gives ChatGPT-compatible MCP clients a small, auditable interface to a workspace you control.
+Gateway eksekusi self-hosted yang memberikan klien MCP yang kompatibel dengan ChatGPT sebuah antarmuka kecil dan bisa di-audit ke workspace yang Anda kontrol.
 
-It can run in two independent modes:
+Dapat berjalan dalam dua mode independen:
 
-1. **MCP gateway** — the default. Exposes workspace file tools and an optional restricted native-command tool.
-2. **Webhook worker** — optional. Accepts authenticated jobs, asks a Middleman LLM to translate intent into an execution plan, then applies deterministic execution policy before running native commands or Codex.
+1. **MCP gateway** — mode default. Mengekspos tool file workspace dan tool perintah native terbatas secara opsional.
+2. **Webhook worker** — opsional. Menerima job terautentikasi, meminta Middleman LLM menerjemahkan intent menjadi rencana eksekusi, lalu menerapkan kebijakan eksekusi deterministik sebelum menjalankan perintah native atau Codex.
 
-The project is designed for people who want an AI client to work against a private VPS, development box, or controlled repository **without exposing a general-purpose unauthenticated shell**.
+Proyek ini dirancang untuk orang yang ingin klien AI bekerja terhadap VPS privat, development box, atau repositori terkontrol **tanpa mengekspos shell tanpa autentikasi untuk tujuan umum**.
 
 ---
 
-## Table of contents
+## Daftar isi
 
-- [Purpose](#purpose)
-- [What this project is and is not](#what-this-project-is-and-is-not)
-- [Architecture](#architecture)
-- [Feature overview](#feature-overview)
-- [Security model](#security-model)
-- [Requirements](#requirements)
-- [Quick start: MCP-only](#quick-start-mcp-only)
-- [MCP tools](#mcp-tools)
-- [Testing the MCP endpoint manually](#testing-the-mcp-endpoint-manually)
-- [Enabling writes](#enabling-writes)
-- [Enabling restricted command execution](#enabling-restricted-command-execution)
-- [Connecting a remote MCP client](#connecting-a-remote-mcp-client)
-- [Webhook worker mode](#webhook-worker-mode)
-- [Codex execution](#codex-execution)
-- [Health, readiness, and metrics](#health-readiness-and-metrics)
+- [Tujuan](#tujuan)
+- [Apa proyek ini dan apa yang bukan](#apa-proyek-ini-dan-apa-yang-bukan)
+- [Arsitektur](#arsitektur)
+- [Ringkasan fitur](#ringkasan-fitur)
+- [Model keamanan](#model-keamanan)
+- [Kebutuhan](#kebutuhan)
+- [Mulai cepat: MCP-only](#mulai-cepat-mcp-only)
+- [Tool MCP](#tool-mcp)
+- [Menguji endpoint MCP secara manual](#menguji-endpoint-mcp-secara-manual)
+- [Mengaktifkan tulis](#mengaktifkan-tulis)
+- [Mengaktifkan eksekusi perintah terbatas](#mengaktifkan-eksekusi-perintah-terbatas)
+- [Menghubungkan klien MCP jarak jauh](#menghubungkan-klien-mcp-jarak-jauh)
+- [Mode webhook worker](#mode-webhook-worker)
+- [Eksekusi Codex](#eksekusi-codex)
+- [Health, readiness, dan metrics](#health-readiness-dan-metrics)
 - [Audit logging](#audit-logging)
-- [Configuration reference](#configuration-reference)
-- [Systemd deployment](#systemd-deployment)
-- [Release and deployment workflow](#release-and-deployment-workflow)
-- [Testing and CI](#testing-and-ci)
+- [Referensi konfigurasi](#referensi-konfigurasi)
+- [Deployment systemd](#deployment-systemd)
+- [Alur rilis dan deployment](#alur-rilis-dan-deployment)
+- [Pengujian dan CI](#pengujian-dan-ci)
 - [Troubleshooting](#troubleshooting)
-- [Operational recommendations](#operational-recommendations)
-- [Known architectural follow-ups](#known-architectural-follow-ups)
+- [Rekomendasi operasional](#rekomendasi-operasional)
+- [Tindak lanjut arsitektur yang diketahui](#tindak-lanjut-arsitektur-yang-diketahui)
 
 ---
 
-## Purpose
+## Tujuan
 
-The main goal of `gpt-go-agent` is to provide a **small execution boundary** between an AI client and a machine you control.
+Tujuan utama `gpt-go-agent` adalah menyediakan **batas eksekusi kecil** antara klien AI dan mesin yang Anda kontrol.
 
-A typical use case looks like this:
+Kasus penggunaan tipikal terlihat seperti ini:
 
 ```text
-ChatGPT / MCP client
+Klien ChatGPT / MCP
         |
-        | authenticated MCP requests
+        | permintaan MCP terautentikasi
         v
   gpt-go-agent
         |
-        +-- rooted workspace access
-        +-- optional file writes
-        +-- optional restricted native commands
-        +-- bounded execution
+        +-- akses workspace ter-root
+        +-- tulis file opsional
+        +-- perintah native terbatas opsional
+        +-- eksekusi terbatas
         +-- audit log
         |
         v
- private VPS / repository / workspace
+ VPS / repositori / workspace privat
 ```
 
-The daemon is useful when you want an AI client to:
+Daemon berguna saat Anda ingin klien AI untuk:
 
-- inspect files in a private repository;
-- create or update files inside one controlled workspace;
-- run a small set of diagnostic native commands;
-- keep an audit trail of tool calls;
-- avoid exposing SSH or a raw shell directly to the model;
-- optionally accept durable asynchronous jobs through an HTTP webhook API;
-- optionally delegate coding jobs to Codex with a read-only or workspace-write sandbox.
+- memeriksa file di repositori privat;
+- membuat atau memperbarui file di dalam satu workspace terkontrol;
+- menjalankan sekumpulan kecil perintah native diagnostik;
+- menyimpan jejak audit pemanggilan tool;
+- menghindari mengekspos SSH atau raw shell langsung ke model;
+- secara opsional menerima job asinkron durable melalui API webhook HTTP;
+- secara opsional mendelegasikan job coding ke Codex dengan sandbox read-only atau workspace-write.
 
-The default deployment is intentionally conservative:
+Deployment default sengaja konservatif:
 
-- loopback listener;
-- file writes disabled;
-- native command execution disabled;
-- webhook execution disabled;
-- Codex writes disabled.
+- listener loopback;
+- tulis file nonaktif;
+- eksekusi perintah native nonaktif;
+- eksekusi webhook nonaktif;
+- tulis Codex nonaktif.
 
-You explicitly enable additional capabilities.
-
----
-
-## What this project is and is not
-
-### It is
-
-- an MCP HTTP server;
-- a workspace-scoped file gateway;
-- a restricted command executor;
-- an audit boundary;
-- an optional durable asynchronous job runner;
-- an optional Middleman-to-Codex/native execution bridge.
-
-### It is not
-
-- a replacement for SSH;
-- a general-purpose remote shell;
-- a container runtime;
-- a complete OS sandbox;
-- an LLM embedded inside the MCP server;
-- a guarantee that arbitrary binaries become safe because their executable name is allowlisted.
-
-The distinction around command execution is important.
-
-`AGENT_ALLOWED_COMMANDS` is only the **first gate**. A command must also pass the deterministic restricted-command policy implemented by the server.
-
-For example, adding `python3` to `AGENT_ALLOWED_COMMANDS` does **not** make `python3 -c ...` executable through the restricted MCP command tool.
+Anda secara eksplisit mengaktifkan kapabilitas tambahan.
 
 ---
 
-## Architecture
+## Apa proyek ini dan apa yang bukan
 
-### MCP path
+### Proyek ini adalah
+
+- sebuah server HTTP MCP;
+- gateway file dengan scope workspace;
+- eksekutor perintah terbatas;
+- batas audit;
+- runner job asinkron durable opsional;
+- jembatan eksekusi Middleman-ke-Codex/native opsional.
+
+### Proyek ini bukan
+
+- pengganti SSH;
+- remote shell untuk tujuan umum;
+- runtime container;
+- sandbox OS lengkap;
+- LLM yang disematkan di dalam server MCP;
+- jaminan bahwa sembarang binary menjadi aman hanya karena nama executable-nya di-allowlist.
+
+Pembedaan terkait eksekusi perintah itu penting.
+
+`AGENT_ALLOWED_COMMANDS` hanya **gerbang pertama**. Sebuah perintah juga harus melewati kebijakan perintah terbatas deterministik yang diimplementasikan oleh server.
+
+Misalnya, menambahkan `python3` ke `AGENT_ALLOWED_COMMANDS` **tidak** membuat `python3 -c ...` dapat dieksekusi lewat tool perintah terbatas MCP.
+
+---
+
+## Arsitektur
+
+### Jalur MCP
 
 ```text
-ChatGPT / MCP client
+Klien ChatGPT / MCP
         |
         | POST /mcp
         v
 +-------------------------+
 |      gpt-go-agent       |
 |-------------------------|
-| Bearer authentication   |
-| Rooted workspace        |
-| Read/write capability   |
-| Restricted cmd policy   |
-| Timeout/output limits   |
-| Environment sanitizing  |
+| Autentikasi bearer      |
+| Workspace ter-root      |
+| Kapabilitas baca/tulis  |
+| Kebijakan cmd terbatas  |
+| Batas timeout/output    |
+| Sanitasi environment    |
 | Audit logging           |
 +------------+------------+
              |
              v
-       controlled host
+       host terkontrol
 ```
 
-MCP file operations are performed through Go's rooted filesystem API. This prevents a path or symlink inside the workspace from transparently resolving outside the configured root.
+Operasi file MCP dilakukan melalui API filesystem ter-root milik Go. Ini mencegah sebuah path atau symlink di dalam workspace secara transparan ter-resolve ke luar root yang dikonfigurasi.
 
-### Optional webhook path
+### Jalur webhook opsional
 
 ```text
-Webhook caller
+Pemanggil webhook
       |
-      | Bearer token
+      | Token bearer
       | Idempotency-Key
       v
 +----------------------+
@@ -173,83 +173,83 @@ command policy    read-only by default
       workspace
 ```
 
-The Middleman is **not** the final security authority. Its output is treated as an execution proposal.
+Middleman **bukan** otoritas keamanan final. Output-nya diperlakukan sebagai proposal eksekusi.
 
-Native commands must still pass deterministic server-side policy before a child process is created.
+Perintah native tetap harus melewati kebijakan server-side deterministik sebelum child process dibuat.
 
 ---
 
-## Feature overview
+## Ringkasan fitur
 
-| Feature | Default | Notes |
+| Fitur | Default | Catatan |
 |---|---|---|
-| MCP HTTP endpoint | enabled | `POST /mcp` |
-| Workspace file listing | enabled | rooted to `AGENT_WORKSPACE` |
-| Workspace file reading | enabled | rooted and output bounded |
-| Workspace file writing | disabled | enable with `AGENT_ALLOW_WRITE=1` |
-| MCP native execution | disabled | enable with `AGENT_ALLOW_COMMAND_EXEC=1` |
-| MCP bearer token | optional for loopback read-only | mandatory when write/exec is enabled |
-| Restricted native policy | always enforced | independent of executable allowlist |
-| Audit log | enabled | JSON Lines, mode 0600 |
-| Webhook worker | disabled | `AGENT_WEBHOOK_ENABLED=1` |
-| Webhook authentication | required when enabled | separate bearer token |
-| Durable webhook jobs | enabled with webhook | JSON snapshot store + backup |
-| Idempotency | enabled with webhook | `Idempotency-Key` |
-| Middleman retries | configurable | bounded retry + circuit breaker |
-| Codex execution | available in webhook mode | requires Codex CLI |
-| Codex workspace writes | disabled | explicit `AGENT_CODEX_ALLOW_WRITE=1` |
-| Health endpoint | enabled | `GET /healthz` |
-| Readiness endpoint | enabled | `GET /readyz` |
-| Metrics endpoint | enabled | `GET /metrics` |
+| Endpoint HTTP MCP | aktif | `POST /mcp` |
+| Listing file workspace | aktif | ter-root ke `AGENT_WORKSPACE` |
+| Baca file workspace | aktif | ter-root dan output terbatas |
+| Tulis file workspace | nonaktif | aktifkan dengan `AGENT_ALLOW_WRITE=1` |
+| Eksekusi native MCP | nonaktif | aktifkan dengan `AGENT_ALLOW_COMMAND_EXEC=1` |
+| Bearer token MCP | opsional untuk loopback read-only | wajib saat tulis/exec diaktifkan |
+| Kebijakan native terbatas | selalu diterapkan | independen dari executable allowlist |
+| Audit log | aktif | JSON Lines, mode 0600 |
+| Webhook worker | nonaktif | `AGENT_WEBHOOK_ENABLED=1` |
+| Autentikasi webhook | wajib saat diaktifkan | bearer token terpisah |
+| Durable webhook jobs | aktif bersama webhook | JSON snapshot store + backup |
+| Idempotency | aktif bersama webhook | `Idempotency-Key` |
+| Retry Middleman | dapat dikonfigurasi | retry terbatas + circuit breaker |
+| Eksekusi Codex | tersedia di mode webhook | butuh Codex CLI |
+| Tulis workspace Codex | nonaktif | eksplisit `AGENT_CODEX_ALLOW_WRITE=1` |
+| Endpoint health | aktif | `GET /healthz` |
+| Endpoint readiness | aktif | `GET /readyz` |
+| Endpoint metrics | aktif | `GET /metrics` |
 
 ---
 
-## Security model
+## Model keamanan
 
-The security model is based on **multiple independent gates** instead of trusting a single model decision.
+Model keamanan berdasarkan **beberapa gerbang independen**, bukan mempercayai keputusan model tunggal.
 
-### 1. Network exposure
+### 1. Eksposur jaringan
 
-The default listener is:
+Listener default:
 
 ```text
 127.0.0.1:8787
 ```
 
-Keep it on loopback unless you intentionally configure authentication and a secure transport/tunnel.
+Tetap di loopback kecuali Anda secara sengaja mengonfigurasi autentikasi dan transport/tunnel aman.
 
-### 2. MCP authentication
+### 2. Autentikasi MCP
 
-Remote MCP requests require a bearer token.
+Permintaan MCP jarak jauh butuh bearer token.
 
-When no MCP token is configured, tokenless requests are accepted only from loopback and only while the server is read-only/non-executing.
+Saat token MCP tidak dikonfigurasi, permintaan tanpa token hanya diterima dari loopback dan hanya ketika server read-only/non-executing.
 
-If either of these is enabled:
+Jika salah satu ini diaktifkan:
 
 ```text
 AGENT_ALLOW_WRITE=1
 AGENT_ALLOW_COMMAND_EXEC=1
 ```
 
-then `AGENT_MCP_TOKEN` becomes mandatory at startup.
+maka `AGENT_MCP_TOKEN` menjadi wajib saat startup.
 
-Bearer secrets are compared using constant-time comparison.
+Secret bearer dibandingkan menggunakan constant-time comparison.
 
-### 3. Rooted workspace
+### 3. Workspace ter-root
 
-All file operations are scoped to:
+Semua operasi file di-scope ke:
 
 ```text
 AGENT_WORKSPACE
 ```
 
-The server rejects:
+Server menolak:
 
-- absolute paths;
-- parent traversal outside the workspace;
-- symlink traversal that escapes the workspace.
+- path absolut;
+- parent traversal keluar workspace;
+- symlink traversal yang keluar workspace.
 
-Examples that are not valid workspace access:
+Contoh yang bukan akses workspace yang valid:
 
 ```text
 /etc/passwd
@@ -257,28 +257,28 @@ Examples that are not valid workspace access:
 workspace-link -> /etc
 ```
 
-### 4. Writes are opt-in
+### 4. Tulis bersifat opt-in
 
 ```text
 AGENT_ALLOW_WRITE=0
 ```
 
-is the default.
+adalah default.
 
-This controls MCP file writes.
+Ini mengontrol tulis file MCP.
 
-Codex writes are controlled separately by `AGENT_CODEX_ALLOW_WRITE`.
+Tulis Codex dikontrol terpisah oleh `AGENT_CODEX_ALLOW_WRITE`.
 
-### 5. Restricted native execution
+### 5. Eksekusi native terbatas
 
-Native command execution requires all of the following:
+Eksekusi perintah native mensyaratkan semua berikut:
 
 1. `AGENT_ALLOW_COMMAND_EXEC=1`;
-2. an MCP token;
-3. the executable appears in `AGENT_ALLOWED_COMMANDS`;
-4. the executable and arguments pass deterministic restricted policy.
+2. token MCP;
+3. executable muncul di `AGENT_ALLOWED_COMMANDS`;
+4. executable dan argumen melewati kebijakan terbatas deterministik.
 
-The current restricted policy allows:
+Kebijakan terbatas saat ini memperbolehkan:
 
 ```text
 echo
@@ -290,7 +290,7 @@ id
 ls
 ```
 
-The policy deliberately rejects general execution primitives such as:
+Kebijakan dengan sengaja menolak primitif eksekusi umum seperti:
 
 ```text
 sh
@@ -306,68 +306,68 @@ curl
 wget
 ```
 
-Adding one of those names to `AGENT_ALLOWED_COMMANDS` does not bypass deterministic policy.
+Menambahkan salah satu nama tersebut ke `AGENT_ALLOWED_COMMANDS` tidak melewati kebijakan deterministik.
 
-### 6. No shell command strings
+### 6. Tidak ada string perintah shell
 
-Native execution uses argument arrays with `os/exec`. It does not concatenate request text into `sh -c`.
+Eksekusi native memakai array argumen dengan `os/exec`. Ia tidak menggabungkan teks permintaan ke dalam `sh -c`.
 
-### 7. Fixed native working directory
+### 7. Direktori kerja native tetap
 
-Restricted native commands start from the configured workspace root.
+Perintah native terbatas dimulai dari root workspace yang dikonfigurasi.
 
-Custom `cwd` values are rejected.
+Nilai `cwd` kustom ditolak.
 
-### 8. Child environment sanitizing
+### 8. Sanitasi environment child
 
-Credential-like environment variables are removed from native child processes.
+Variabel environment yang menyerupai credential dihapus dari proses child native.
 
-Codex uses its own child environment path because it may legitimately require authentication/configuration.
+Codex menggunakan jalur environment child sendiri karena secara sah mungkin memerlukan autentikasi/konfigurasi.
 
-### 9. Bounded execution
+### 9. Eksekusi terbatas
 
-Native/Codex output is bounded.
+Output native/Codex dibatasi.
 
-MCP command execution also has a configurable timeout.
+Eksekusi perintah MCP juga punya timeout yang dapat dikonfigurasi.
 
-### 10. Systemd hardening
+### 10. Hardening systemd
 
-The included service unit adds defense in depth with controls such as:
+Unit layanan yang disertakan menambahkan defense in depth dengan kontrol seperti:
 
 - `NoNewPrivileges=true`;
 - `ProtectSystem=strict`;
 - `ProtectHome=true`;
 - empty capability bounding set;
-- namespace restrictions;
-- device restrictions;
-- kernel/proc restrictions.
+- pembatasan namespace;
+- pembatasan device;
+- pembatasan kernel/proc.
 
-Systemd hardening is additional protection. It does not replace application-level path and execution policy.
+Hardening systemd adalah perlindungan tambahan. Ia tidak menggantikan kebijakan path dan eksekusi di level aplikasi.
 
 ---
 
-## Requirements
+## Kebutuhan
 
 ### Build
 
-- Go 1.24 or compatible project toolchain;
-- Linux is the primary deployment target.
+- Go 1.24 atau project toolchain yang kompatibel;
+- Linux adalah target deployment utama.
 
-### Optional webhook/Codex mode
+### Opsional mode webhook/Codex
 
-Depending on the configuration:
+Tergantung konfigurasi:
 
-- an OpenAI-compatible Middleman endpoint;
-- a Middleman model/API key if required by that endpoint;
-- Codex CLI if Middleman decisions can dispatch to Codex.
+- endpoint Middleman yang kompatibel dengan OpenAI;
+- model Middleman/API key jika diperlukan endpoint tersebut;
+- Codex CLI jika keputusan Middleman dapat mendispatch ke Codex.
 
-The basic MCP-only mode does **not** require a Middleman, Codex, or webhook token.
+Mode MCP-only dasar **tidak** memerlukan Middleman, Codex, atau webhook token.
 
 ---
 
-## Quick start: MCP-only
+## Mulai cepat: MCP-only
 
-Clone and build:
+Clone dan build:
 
 ```bash
 git clone https://github.com/dragovics/gpt-go-agent.git
@@ -376,14 +376,14 @@ cd gpt-go-agent
 go build -o ./gpt-go-agent ./cmd/gpt-go-agent
 ```
 
-Create a workspace:
+Buat workspace:
 
 ```bash
 mkdir -p /tmp/gpt-go-agent-workspace
 printf 'hello from workspace\n' > /tmp/gpt-go-agent-workspace/hello.txt
 ```
 
-Run the daemon in read-only MCP mode:
+Jalankan daemon dalam mode MCP read-only:
 
 ```bash
 AGENT_WORKSPACE=/tmp/gpt-go-agent-workspace \
@@ -391,25 +391,25 @@ AGENT_LISTEN_ADDR=127.0.0.1:8787 \
 ./gpt-go-agent
 ```
 
-Check health:
+Cek health:
 
 ```bash
 curl -sS http://127.0.0.1:8787/healthz
 ```
 
-Example response:
+Contoh respons:
 
 ```json
 {"ok":true,"version":"0.2.1-dev"}
 ```
 
-Check readiness:
+Cek readiness:
 
 ```bash
 curl -sS http://127.0.0.1:8787/readyz
 ```
 
-Example:
+Contoh:
 
 ```json
 {"ready":true}
@@ -417,11 +417,11 @@ Example:
 
 ---
 
-## MCP tools
+## Tool MCP
 
 ### `list_dir`
 
-Lists entries under a workspace-relative directory.
+Membuat daftar entry di bawah direktori relatif-workspace.
 
 Input:
 
@@ -433,7 +433,7 @@ Input:
 
 ### `read_file`
 
-Reads a UTF-8 text file under the workspace.
+Membaca file teks UTF-8 di bawah workspace.
 
 Input:
 
@@ -443,13 +443,13 @@ Input:
 }
 ```
 
-Large output is truncated to the configured MCP output limit.
+Output besar akan di-truncate ke batas output MCP yang dikonfigurasi.
 
 ### `write_file`
 
-Writes a UTF-8 file under the workspace.
+Menulis file UTF-8 di bawah workspace.
 
-Requires:
+Membutuhkan:
 
 ```text
 AGENT_ALLOW_WRITE=1
@@ -465,13 +465,13 @@ Input:
 }
 ```
 
-Parent directories are created inside the rooted workspace as needed.
+Direktori parent dibuat di dalam workspace ter-root sesuai kebutuhan.
 
 ### `exec_command`
 
-Runs a restricted native command.
+Menjalankan perintah native terbatas.
 
-Requires:
+Membutuhkan:
 
 ```text
 AGENT_ALLOW_COMMAND_EXEC=1
@@ -479,7 +479,7 @@ AGENT_MCP_TOKEN=<token>
 AGENT_ALLOWED_COMMANDS=<allowlist>
 ```
 
-Example input:
+Contoh input:
 
 ```json
 {
@@ -488,15 +488,15 @@ Example input:
 }
 ```
 
-The executable must be present in the configured server allowlist **and** accepted by deterministic policy.
+Executable harus muncul di allowlist server yang dikonfigurasi **dan** diterima oleh kebijakan deterministik.
 
-Custom working directories are not supported; commands execute from the workspace root.
+Direktori kerja kustom tidak didukung; perintah dijalankan dari root workspace.
 
 ---
 
-## Testing the MCP endpoint manually
+## Menguji endpoint MCP secara manual
 
-The current hand-written MCP endpoint implements protocol version:
+Implementasi MCP yang ditulis tangan saat ini menerapkan versi protokol:
 
 ```text
 2025-06-18
@@ -504,7 +504,7 @@ The current hand-written MCP endpoint implements protocol version:
 
 ### Initialize
 
-Without a token in loopback read-only mode:
+Tanpa token dalam mode loopback read-only:
 
 ```bash
 curl -sS http://127.0.0.1:8787/mcp \
@@ -517,11 +517,11 @@ curl -sS http://127.0.0.1:8787/mcp \
   }'
 ```
 
-With authentication:
+Dengan autentikasi:
 
 ```bash
 curl -sS http://127.0.0.1:8787/mcp \
-  -H 'Authorization: Bearer YOUR_MCP_TOKEN' \
+  -H 'Authorization: Bearer ***' \
   -H 'Content-Type: application/json' \
   --data '{
     "jsonrpc":"2.0",
@@ -535,7 +535,7 @@ curl -sS http://127.0.0.1:8787/mcp \
 
 ```bash
 curl -sS http://127.0.0.1:8787/mcp \
-  -H 'Authorization: Bearer YOUR_MCP_TOKEN' \
+  -H 'Authorization: Bearer ***' \
   -H 'Content-Type: application/json' \
   --data '{
     "jsonrpc":"2.0",
@@ -545,11 +545,11 @@ curl -sS http://127.0.0.1:8787/mcp \
   }'
 ```
 
-### Read a file
+### Baca file
 
 ```bash
 curl -sS http://127.0.0.1:8787/mcp \
-  -H 'Authorization: Bearer YOUR_MCP_TOKEN' \
+  -H 'Authorization: Bearer ***' \
   -H 'Content-Type: application/json' \
   --data '{
     "jsonrpc":"2.0",
@@ -562,11 +562,11 @@ curl -sS http://127.0.0.1:8787/mcp \
   }'
 ```
 
-### Run a restricted command
+### Jalankan perintah terbatas
 
 ```bash
 curl -sS http://127.0.0.1:8787/mcp \
-  -H 'Authorization: Bearer YOUR_MCP_TOKEN' \
+  -H 'Authorization: Bearer ***' \
   -H 'Content-Type: application/json' \
   --data '{
     "jsonrpc":"2.0",
@@ -581,105 +581,105 @@ curl -sS http://127.0.0.1:8787/mcp \
 
 ---
 
-## Enabling writes
+## Mengaktifkan tulis
 
-Set a strong MCP token and explicitly enable writes:
+Set token MCP yang kuat dan aktifkan tulis secara eksplisit:
 
 ```bash
-export AGENT_MCP_TOKEN='replace-with-a-long-random-secret'
+export AGENT_MCP_TOKEN='ganti-dengan-secret-random-yang-panjang'
 export AGENT_ALLOW_WRITE=1
 export AGENT_WORKSPACE=/var/lib/gpt-go-agent/workspace
 
 ./gpt-go-agent
 ```
 
-The server refuses to start with writes enabled and an empty MCP token.
+Server menolak start dengan tulis diaktifkan dan token MCP kosong.
 
-A simple secret can be generated with a local tool such as:
+Secret sederhana dapat di-generate dengan tool lokal seperti:
 
 ```bash
 openssl rand -hex 32
 ```
 
-Treat the token as a password.
+Perlakukan token sebagai password.
 
 ---
 
-## Enabling restricted command execution
+## Mengaktifkan eksekusi perintah terbatas
 
-Example:
+Contoh:
 
 ```bash
-export AGENT_MCP_TOKEN='replace-with-a-long-random-secret'
+export AGENT_MCP_TOKEN='ganti-dengan-secret-random-yang-panjang'
 export AGENT_ALLOW_COMMAND_EXEC=1
 export AGENT_ALLOWED_COMMANDS='echo uptime pwd date uname id ls'
 
 ./gpt-go-agent
 ```
 
-The allowlist and deterministic policy are intersected.
+Allowlist dan kebijakan deterministik di-intersect.
 
-For example:
+Misalnya:
 
 ```bash
 AGENT_ALLOWED_COMMANDS='python3 uptime'
 ```
 
-does not make Python executable through MCP. `uptime` can pass; `python3` is rejected by deterministic policy.
+tidak membuat Python dapat dieksekusi lewat MCP. `uptime` bisa lolos; `python3` ditolak oleh kebijakan deterministik.
 
-If your actual product requirement is arbitrary remote code execution, do not weaken this restricted tool silently. Introduce a separately named privileged execution mode with explicit trust and deployment assumptions.
+Jika kebutuhan produk Anda sebenarnya adalah eksekusi kode jarak jauh sembarang, jangan melemahkan tool terbatas ini secara diam-diam. Perkenalkan mode eksekusi privileged dengan nama terpisah beserta asumsi trust dan deployment yang eksplisit.
 
 ---
 
-## Connecting a remote MCP client
+## Menghubungkan klien MCP jarak jauh
 
-The default server binds to loopback.
+Server default bind ke loopback.
 
-Recommended topology:
+Topologi yang direkomendasikan:
 
 ```text
-ChatGPT / remote MCP client
+Klien ChatGPT / MCP jarak jauh
         |
         | secure tunnel / private network
         v
-127.0.0.1:8787 on your VPS
+127.0.0.1:8787 di VPS Anda
         |
         v
 gpt-go-agent
 ```
 
-For any non-loopback deployment:
+Untuk deployment non-loopback:
 
-- configure `AGENT_MCP_TOKEN`;
-- use TLS or a trusted secure tunnel;
-- do not expose an unauthenticated HTTP endpoint directly to the internet;
-- keep the workspace limited to files the agent genuinely needs.
+- konfigurasikan `AGENT_MCP_TOKEN`;
+- gunakan TLS atau secure tunnel tepercaya;
+- jangan ekspos endpoint HTTP tanpa autentikasi langsung ke internet;
+- batasi workspace ke file yang benar-benar dibutuhkan agent.
 
-Exact MCP-client setup differs between clients. The endpoint to configure is:
+Setup klien MCP persisnya berbeda antar klien. Endpoint yang dikonfigurasi adalah:
 
 ```text
 POST /mcp
 ```
 
-with:
+dengan:
 
 ```http
-Authorization: Bearer <AGENT_MCP_TOKEN>
+Authorization: Bearer ***
 ```
 
-when authentication is enabled.
+saat autentikasi diaktifkan.
 
 ---
 
-## Webhook worker mode
+## Mode webhook worker
 
-Webhook mode is independent from normal MCP operation and is disabled by default.
+Mode webhook independen dari operasi MCP normal dan nonaktif secara default.
 
-Enable it with:
+Aktifkan dengan:
 
 ```bash
 export AGENT_WEBHOOK_ENABLED=1
-export AGENT_WEBHOOK_TOKEN='replace-with-a-separate-random-secret'
+export AGENT_WEBHOOK_TOKEN='ganti-dengan-secret-random-terpisah'
 
 export AGENT_MIDDLEMAN_URL='http://127.0.0.1:20128/v1'
 export AGENT_MIDDLEMAN_MODEL='glm-5.3'
@@ -688,7 +688,7 @@ export AGENT_MIDDLEMAN_KEY='...'
 ./gpt-go-agent
 ```
 
-When enabled, these endpoints are mounted:
+Saat diaktifkan, endpoint berikut di-mount:
 
 ```text
 POST /webhook
@@ -696,13 +696,13 @@ GET  /webhook?limit=50&offset=0
 GET  /webhook/{job-id}
 ```
 
-When webhook mode is disabled, these routes are not mounted.
+Ketika mode webhook nonaktif, route ini tidak di-mount.
 
-### Create a job
+### Buat job
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8787/webhook \
-  -H 'Authorization: Bearer YOUR_WEBHOOK_TOKEN' \
+  -H 'Authorization: Bearer YOUR_W...OKEN' \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: example-job-001' \
   -H 'X-Request-ID: local-test-001' \
@@ -712,9 +712,9 @@ curl -sS -X POST http://127.0.0.1:8787/webhook \
   }'
 ```
 
-A new job normally returns HTTP `202 Accepted`.
+Job baru biasanya mengembalikan HTTP `202 Accepted`.
 
-Example response:
+Contoh respons:
 
 ```json
 {
@@ -723,49 +723,49 @@ Example response:
 }
 ```
 
-### Poll a job
+### Poll job
 
 ```bash
 curl -sS http://127.0.0.1:8787/webhook/JOB_ID \
-  -H 'Authorization: Bearer YOUR_WEBHOOK_TOKEN'
+  -H 'Authorization: Bearer YOUR_W...OKEN'
 ```
 
 ### List jobs
 
 ```bash
 curl -sS 'http://127.0.0.1:8787/webhook?limit=50&offset=0' \
-  -H 'Authorization: Bearer YOUR_WEBHOOK_TOKEN'
+  -H 'Authorization: Bearer YOUR_W...OKEN'
 ```
 
-Pagination constraints:
+Batasan pagination:
 
-- default limit: 50;
-- maximum limit: 200;
-- offset must be non-negative.
+- limit default: 50;
+- limit maksimum: 200;
+- offset harus non-negatif.
 
 ### Idempotency
 
-If the same `Idempotency-Key` is reused with the same request content, the existing job is returned instead of creating another job.
+Jika `Idempotency-Key` yang sama dipakai ulang dengan konten permintaan yang sama, job yang sudah ada dikembalikan alih-alih membuat job baru.
 
-If the same key is reused with different content, the server returns HTTP `409 Conflict`.
+Jika key yang sama dipakai ulang dengan konten berbeda, server mengembalikan HTTP `409 Conflict`.
 
-This makes retries from webhook callers safer.
+Ini membuat retry dari pemanggil webhook lebih aman.
 
-### Correlation IDs
+### Correlation ID
 
-Send:
+Kirim:
 
 ```http
 X-Request-ID: your-correlation-id
 ```
 
-The ID is stored with the job and included in audit records.
+ID disimpan bersama job dan disertakan di record audit.
 
-If no request ID is provided, the worker generates one.
+Jika tidak ada request ID, worker akan men-generate satu.
 
-### Job states
+### State job
 
-Jobs can move through these states:
+Job dapat berpindah melalui state berikut:
 
 ```text
 pending
@@ -776,7 +776,7 @@ completed
 failed
 ```
 
-Typical successful lifecycle:
+Siklus sukses tipikal:
 
 ```text
 pending
@@ -791,138 +791,138 @@ running
 completed
 ```
 
-Policy rejection:
+Penolakan kebijakan:
 
 ```text
 pending -> evaluating -> rejected
 ```
 
-Operational failure:
+Kegagalan operasional:
 
 ```text
 pending -> evaluating/running -> failed
 ```
 
-Retryable Middleman failures can move a job back to `pending` before another bounded attempt.
+Kegagalan Middleman yang dapat di-retry dapat mengembalikan job ke `pending` sebelum attempt terbatas lain.
 
 ### Durable store
 
-Default path:
+Path default:
 
 ```text
 /var/lib/gpt-go-agent/jobs/store.json
 ```
 
-The store uses:
+Store menggunakan:
 
-1. a temporary file;
-2. file `fsync`;
-3. primary-to-backup rename;
-4. temp-to-primary rename;
-5. directory `fsync`.
+1. file sementara;
+2. `fsync` file;
+3. rename primary ke backup;
+4. rename temp ke primary;
+5. `fsync` direktori.
 
-At startup:
+Saat startup:
 
-- a valid primary is preferred;
-- a missing/corrupt primary falls back to `.bak`;
-- if both are absent, the store starts empty;
-- if both exist but are invalid, startup fails rather than silently inventing state.
+- primary yang valid lebih diutamakan;
+- primary yang hilang/rusak fallback ke `.bak`;
+- jika keduanya absen, store mulai kosong;
+- jika keduanya ada tapi invalid, startup gagal, bukan diam-diam mengarang state.
 
-This store is appropriate for modest workloads. See [Known architectural follow-ups](#known-architectural-follow-ups) for the high-volume storage direction.
+Store ini cocok untuk workload menengah. Lihat [Tindak lanjut arsitektur yang diketahui](#tindak-lanjut-arsitektur-yang-diketahui) untuk arah storage volume tinggi.
 
 ---
 
-## Codex execution
+## Eksekusi Codex
 
-Webhook decisions may dispatch a coding task to Codex.
+Keputusan webhook dapat mendispatch task coding ke Codex.
 
-Codex is **read-only by default**:
+Codex **read-only secara default**:
 
 ```text
 AGENT_CODEX_ALLOW_WRITE=0
 ```
 
-The effective Codex sandbox is:
+Sandbox Codex efektif menjadi:
 
 ```text
 read-only
 ```
 
-To deliberately grant workspace mutation:
+Untuk secara sengaja memberikan mutasi workspace:
 
 ```bash
 export AGENT_CODEX_ALLOW_WRITE=1
 ```
 
-The effective sandbox then becomes:
+Sandbox efektif menjadi:
 
 ```text
 workspace-write
 ```
 
-Codex write permission is intentionally separate from MCP `AGENT_ALLOW_WRITE`.
+Izin tulis Codex sengaja terpisah dari MCP `AGENT_ALLOW_WRITE`.
 
-That means:
+Artinya:
 
 ```text
 AGENT_ALLOW_WRITE=0
 AGENT_CODEX_ALLOW_WRITE=1
 ```
 
-is a valid configuration: MCP cannot call `write_file`, while the Codex webhook executor may still modify its workspace.
+adalah konfigurasi yang valid: MCP tidak dapat memanggil `write_file`, sedangkan webhook executor Codex tetap boleh memodifikasi workspace-nya.
 
-Similarly:
+Demikian pula:
 
 ```text
 AGENT_ALLOW_WRITE=1
 AGENT_CODEX_ALLOW_WRITE=0
 ```
 
-allows authenticated MCP file writes while Codex remains read-only.
+mengizinkan tulis file MCP terautentikasi sementara Codex tetap read-only.
 
 ---
 
-## Health, readiness, and metrics
+## Health, readiness, dan metrics
 
 ### `GET /healthz`
 
-Returns process health and version:
+Mengembalikan kesehatan proses dan versi:
 
 ```bash
 curl -sS http://127.0.0.1:8787/healthz
 ```
 
-Example:
+Contoh:
 
 ```json
 {"ok":true,"version":"0.2.1-dev"}
 ```
 
-Release builds override the development version through linker flags.
+Build release menimpa versi development melalui linker flags.
 
 ### `GET /readyz`
 
-MCP-only mode is ready after startup.
+Mode MCP-only siap setelah startup.
 
-Webhook mode additionally checks that the required Middleman configuration is present.
+Mode webhook juga memeriksa apakah konfigurasi Middleman yang diperlukan tersedia.
 
 ```bash
 curl -i http://127.0.0.1:8787/readyz
 ```
 
-A non-ready service returns HTTP `503`.
+Layanan yang belum siap mengembalikan HTTP `503`.
 
 ### `GET /metrics`
 
-Prometheus-text-style metrics are exposed at:
+Metrics gaya Prometheus-text diekspos di:
 
 ```bash
 curl -sS http://127.0.0.1:8787/metrics
 ```
 
-In MCP-only mode, the endpoint may be empty because worker metrics are not registered.
+Dalam mode MCP-only, endpoint bisa kosong karena worker metrics tidak diregistrasi.
 
-Webhook mode can expose metrics such as:
+Mode webhook dapat mengekspos metrics seperti:
 
 ```text
 gpt_go_agent_jobs_total
@@ -937,29 +937,29 @@ gpt_go_agent_jobs_retried
 gpt_go_agent_jobs_dead_lettered
 ```
 
-Middleman metrics are merged into the same output when available.
+Metrics Middleman digabung ke output yang sama saat tersedia.
 
 ---
 
 ## Audit logging
 
-Default audit path:
+Path audit default:
 
 ```text
 agent-audit.jsonl
 ```
 
-Production deployments usually set:
+Deployment produksi biasanya menyetel:
 
 ```text
 AGENT_AUDIT_PATH=/var/lib/gpt-go-agent/agent-audit.jsonl
 ```
 
-The file is opened with mode `0600`.
+File dibuka dengan mode `0600`.
 
-Each line is a JSON object.
+Tiap baris adalah objek JSON.
 
-Representative event:
+Event representatif:
 
 ```json
 {
@@ -970,32 +970,32 @@ Representative event:
 }
 ```
 
-Webhook events can also contain:
+Event webhook juga dapat berisi:
 
 - correlation ID;
-- decision details;
-- duration;
-- failure information.
+- detail keputusan;
+- durasi;
+- informasi kegagalan.
 
-Audit timestamps are normalized to UTC.
+Timestamp audit dinormalisasi ke UTC.
 
 ---
 
-## Configuration reference
+## Referensi konfigurasi
 
 ### Core / MCP
 
-| Variable | Default | Purpose |
+| Variabel | Default | Tujuan |
 |---|---|---|
-| `AGENT_LISTEN_ADDR` | `127.0.0.1:8787` | HTTP listen address |
-| `AGENT_WORKSPACE` | `.` | Root directory exposed to MCP/executors |
-| `AGENT_MCP_TOKEN` | empty | MCP bearer token |
-| `AGENT_ALLOW_WRITE` | `0` | Enable MCP `write_file` |
-| `AGENT_ALLOW_COMMAND_EXEC` | `0` | Enable restricted MCP native execution |
-| `AGENT_ALLOWED_COMMANDS` | empty unless configured | Server-side executable allowlist |
-| `AGENT_AUDIT_PATH` | `agent-audit.jsonl` | Audit JSONL path |
+| `AGENT_LISTEN_ADDR` | `127.0.0.1:8787` | alamat listen HTTP |
+| `AGENT_WORKSPACE` | `.` | direktori root yang diekspos ke MCP/executor |
+| `AGENT_MCP_TOKEN` | kosong | bearer token MCP |
+| `AGENT_ALLOW_WRITE` | `0` | aktifkan MCP `write_file` |
+| `AGENT_ALLOW_COMMAND_EXEC` | `0` | aktifkan eksekusi native MCP terbatas |
+| `AGENT_ALLOWED_COMMANDS` | kosong kecuali dikonfigurasi | allowlist executable server-side |
+| `AGENT_AUDIT_PATH` | `agent-audit.jsonl` | path audit JSONL |
 
-Recommended restricted allowlist:
+Allowlist terbatas yang direkomendasikan:
 
 ```text
 echo,uptime,pwd,date,uname,id,ls
@@ -1003,41 +1003,41 @@ echo,uptime,pwd,date,uname,id,ls
 
 ### Webhook
 
-| Variable | Default | Purpose |
+| Variabel | Default | Tujuan |
 |---|---|---|
-| `AGENT_WEBHOOK_ENABLED` | `0` | Mount/start webhook worker |
-| `AGENT_WEBHOOK_TOKEN` | empty | Webhook bearer token |
-| `AGENT_WEBHOOK_WORKERS` | `4` | Background worker count |
-| `AGENT_WEBHOOK_STORE` | `/var/lib/gpt-go-agent/jobs/store.json` | Durable job store |
-| `AGENT_WEBHOOK_RETENTION` | `168h` | Terminal job retention |
-| `AGENT_WEBHOOK_CLEANUP_INTERVAL` | `1h` | Retention cleanup interval |
-| `AGENT_WEBHOOK_MAX_GATEKEEPER_RETRIES` | `2` | Worker-level Middleman retries |
-| `AGENT_WEBHOOK_RETRY_BASE` | `500ms` | Worker retry base delay |
-| `AGENT_WEBHOOK_MAX_OUTPUT_BYTES` | `65536` | Native/Codex output cap |
+| `AGENT_WEBHOOK_ENABLED` | `0` | mount/start webhook worker |
+| `AGENT_WEBHOOK_TOKEN` | kosong | bearer token webhook |
+| `AGENT_WEBHOOK_WORKERS` | `4` | jumlah worker background |
+| `AGENT_WEBHOOK_STORE` | `/var/lib/gpt-go-agent/jobs/store.json` | durable job store |
+| `AGENT_WEBHOOK_RETENTION` | `168h` | retensi job terminal |
+| `AGENT_WEBHOOK_CLEANUP_INTERVAL` | `1h` | interval cleanup retensi |
+| `AGENT_WEBHOOK_MAX_GATEKEEPER_RETRIES` | `2` | retry Middleman level worker |
+| `AGENT_WEBHOOK_RETRY_BASE` | `500ms` | delay dasar retry worker |
+| `AGENT_WEBHOOK_MAX_OUTPUT_BYTES` | `65536` | batas output native/Codex |
 
-`OPENAI_WEBHOOK_SECRET` is accepted as a backwards-compatible fallback for `AGENT_WEBHOOK_TOKEN`, but new deployments should use `AGENT_WEBHOOK_TOKEN`.
+`OPENAI_WEBHOOK_SECRET` diterima sebagai fallback kompatibel-mundur untuk `AGENT_WEBHOOK_TOKEN`, tapi deployment baru sebaiknya pakai `AGENT_WEBHOOK_TOKEN`.
 
 ### Middleman
 
-| Variable | Default | Purpose |
+| Variabel | Default | Tujuan |
 |---|---|---|
-| `AGENT_MIDDLEMAN_URL` | `http://127.0.0.1:20128/v1` | OpenAI-compatible API base |
-| `AGENT_MIDDLEMAN_KEY` | empty | Middleman API key |
-| `AGENT_MIDDLEMAN_MODEL` | `glm-5.3` | Model identifier |
-| `AGENT_MIDDLEMAN_TIMEOUT` | `30s` | Middleman request timeout |
-| `AGENT_MIDDLEMAN_MAX_ATTEMPTS` | `3` | Transport-level attempts |
-| `AGENT_MIDDLEMAN_RETRY_BASE` | `250ms` | Retry base delay |
-| `AGENT_MIDDLEMAN_CIRCUIT_THRESHOLD` | `3` | Failures before breaker opens |
-| `AGENT_MIDDLEMAN_CIRCUIT_OPEN` | `10s` | Circuit open duration |
+| `AGENT_MIDDLEMAN_URL` | `http://127.0.0.1:20128/v1` | base API kompatibel OpenAI |
+| `AGENT_MIDDLEMAN_KEY` | kosong | API key Middleman |
+| `AGENT_MIDDLEMAN_MODEL` | `glm-5.3` | identifier model |
+| `AGENT_MIDDLEMAN_TIMEOUT` | `30s` | timeout request Middleman |
+| `AGENT_MIDDLEMAN_MAX_ATTEMPTS` | `3` | jumlah attempt level transport |
+| `AGENT_MIDDLEMAN_RETRY_BASE` | `250ms` | delay dasar retry |
+| `AGENT_MIDDLEMAN_CIRCUIT_THRESHOLD` | `3` | jumlah kegagalan sebelum breaker terbuka |
+| `AGENT_MIDDLEMAN_CIRCUIT_OPEN` | `10s` | durasi circuit terbuka |
 
 ### Codex
 
-| Variable | Default | Purpose |
+| Variabel | Default | Tujuan |
 |---|---|---|
-| `AGENT_CODEX_BIN` | `codex` | Codex executable |
-| `AGENT_CODEX_ALLOW_WRITE` | `0` | Switch sandbox from read-only to workspace-write |
+| `AGENT_CODEX_BIN` | `codex` | executable Codex |
+| `AGENT_CODEX_ALLOW_WRITE` | `0` | ubah sandbox dari read-only ke workspace-write |
 
-The complete example is in:
+Contoh lengkap ada di:
 
 ```text
 deploy/env.example
@@ -1045,15 +1045,15 @@ deploy/env.example
 
 ---
 
-## Systemd deployment
+## Deployment systemd
 
-The repository includes:
+Repositori menyertakan:
 
 ```text
 deploy/gpt-go-agent.service
 ```
 
-The service expects:
+Service mengharapkan:
 
 ```text
 User=gptagent
@@ -1063,7 +1063,7 @@ EnvironmentFile=/etc/gpt-go-agent/env
 ExecStart=/usr/local/bin/gpt-go-agent
 ```
 
-A typical host preparation looks like:
+Persiapan host tipikal:
 
 ```bash
 sudo useradd --system --home /var/lib/gpt-go-agent --shell /usr/sbin/nologin gptagent
@@ -1081,13 +1081,13 @@ sudo install -o root -g root -m 0644 \
   /etc/systemd/system/gpt-go-agent.service
 ```
 
-Edit the production environment:
+Edit environment produksi:
 
 ```bash
 sudo editor /etc/gpt-go-agent/env
 ```
 
-Then:
+Lalu:
 
 ```bash
 sudo systemctl daemon-reload
@@ -1095,13 +1095,13 @@ sudo systemctl enable --now gpt-go-agent
 sudo systemctl status gpt-go-agent
 ```
 
-Logs:
+Log:
 
 ```bash
 journalctl -u gpt-go-agent -f
 ```
 
-Health from the host:
+Health dari host:
 
 ```bash
 curl -fsS http://127.0.0.1:8787/healthz
@@ -1110,37 +1110,37 @@ curl -fsS http://127.0.0.1:8787/readyz
 
 ---
 
-## Release and deployment workflow
+## Alur rilis dan deployment
 
-Release tags follow:
+Tag rilis mengikuti:
 
 ```text
 vMAJOR.MINOR.PATCH
 ```
 
-The GitHub release workflow builds:
+Workflow release GitHub membangun:
 
 - Linux amd64;
 - Linux arm64;
-- SHA256 checksums.
+- checksum SHA256.
 
-The deploy helper:
+Helper deploy:
 
 ```text
 scripts/deploy.sh
 ```
 
-performs:
+melakukan:
 
-1. executable validation;
-2. staged install;
-3. SHA256 output;
-4. backup of the previous binary;
-5. systemd stop/start;
-6. `/healthz` and `/readyz` checks;
-7. rollback to the previous binary if deployment health fails.
+1. validasi executable;
+2. install bertahap;
+3. output SHA256;
+4. backup binary sebelumnya;
+5. stop/start systemd;
+6. pengecekan `/healthz` dan `/readyz`;
+7. rollback ke binary sebelumnya jika kesehatan deployment gagal.
 
-Usage:
+Penggunaan:
 
 ```bash
 sudo ./scripts/deploy.sh /path/to/gpt-go-agent
@@ -1148,9 +1148,9 @@ sudo ./scripts/deploy.sh /path/to/gpt-go-agent
 
 ---
 
-## Testing and CI
+## Pengujian dan CI
 
-Local baseline:
+Baseline lokal:
 
 ```bash
 go test ./...
@@ -1160,129 +1160,129 @@ go test -cover ./...
 go build ./...
 ```
 
-CI additionally runs:
+CI juga menjalankan:
 
 - Staticcheck;
 - Gosec;
 - Govulncheck.
 
-The application itself targets Go 1.24 in CI. Govulncheck uses a newer supported Go toolchain for the current vulnerability-scanner release; this does not change the application's build target.
+Aplikasinya sendiri menargetkan Go 1.24 di CI. Govulncheck memakai Go toolchain yang lebih baru untuk rilis vulnerability-scanner saat ini; ini tidak mengubah target build aplikasi.
 
-Security regression coverage includes:
+Cakupan regression keamanan meliputi:
 
-- parent traversal rejection;
-- symlink workspace escape;
-- mutation/exec token requirements;
-- restricted native commands;
-- webhook authentication;
-- webhook idempotency;
-- bounded subprocess output;
-- durable-store backup recovery;
-- audit timestamp generation.
+- penolakan parent traversal;
+- escape workspace via symlink;
+- kebutuhan token mutasi/exec;
+- perintah native terbatas;
+- autentikasi webhook;
+- idempotency webhook;
+- output subprocess terbatas;
+- recovery backup durable store;
+- pembangkitan timestamp audit.
 
 ### Smoke test
 
-Run:
+Jalankan:
 
 ```bash
 ./scripts/smoke.sh
 ```
 
-By default it checks:
+Secara default ia memeriksa:
 
 - `/healthz`;
 - `/readyz`;
 - `/metrics`.
 
-To additionally verify that webhook authentication rejects unauthenticated requests:
+Untuk juga memverifikasi bahwa autentikasi webhook menolak permintaan tanpa autentikasi:
 
 ```bash
 CHECK_WEBHOOK_AUTH=1 ./scripts/smoke.sh
 ```
 
-Use that option only when webhook mode is enabled.
+Gunakan opsi itu hanya ketika mode webhook diaktifkan.
 
 ---
 
 ## Troubleshooting
 
-### Server refuses to start: MCP token required
+### Server menolak start: MCP token required
 
-Symptom:
+Gejala:
 
 ```text
 MCP token is required when writes or command execution are enabled
 ```
 
-Cause:
+Penyebab:
 
-You enabled:
+Anda mengaktifkan:
 
 ```text
 AGENT_ALLOW_WRITE=1
 ```
 
-or:
+atau:
 
 ```text
 AGENT_ALLOW_COMMAND_EXEC=1
 ```
 
-without configuring `AGENT_MCP_TOKEN`.
+tanpa mengonfigurasi `AGENT_MCP_TOKEN`.
 
-Fix:
+Perbaikan:
 
 ```bash
 export AGENT_MCP_TOKEN="$(openssl rand -hex 32)"
 ```
 
-Then restart the service.
+Lalu restart service.
 
 ---
 
-### Remote MCP request returns 401
+### Permintaan MCP jarak jauh mengembalikan 401
 
-Check:
+Periksa:
 
-1. `AGENT_MCP_TOKEN` is set on the daemon;
-2. the client sends the same token;
-3. the header format is exactly:
+1. `AGENT_MCP_TOKEN` di-set di daemon;
+2. klien mengirim token yang sama;
+3. format header persisnya:
 
 ```http
-Authorization: Bearer YOUR_TOKEN
+Authorization: Bearer ***
 ```
 
-Also check the service environment actually loaded:
+Periksa juga environment service benar-benar termuat:
 
 ```bash
 sudo systemctl show gpt-go-agent --property=Environment
 sudo journalctl -u gpt-go-agent -n 100
 ```
 
-For secrets stored through `EnvironmentFile`, inspect that file directly with appropriate root permissions instead of printing secrets into shared logs.
+Untuk secret yang disimpan lewat `EnvironmentFile`, periksa file itu langsung dengan permission root yang sesuai, bukan mencetak secret ke log bersama.
 
 ---
 
-### MCP works locally but not remotely
+### MCP bekerja lokal tapi tidak jarak jauh
 
-The default listener is loopback:
+Listener default adalah loopback:
 
 ```text
 127.0.0.1:8787
 ```
 
-This is intentional.
+Ini disengaja.
 
-Prefer a secure tunnel/private network rather than changing the daemon to a public bind.
+Lebih memilih secure tunnel/private network daripada mengubah daemon ke bind publik.
 
-If you deliberately change `AGENT_LISTEN_ADDR`, make sure:
+Jika Anda sengaja mengubah `AGENT_LISTEN_ADDR`, pastikan:
 
-- bearer authentication is configured;
-- firewall rules are correct;
-- TLS/tunneling is present;
-- you understand the exposure.
+- autentikasi bearer dikonfigurasi;
+- aturan firewall benar;
+- TLS/tunneling ada;
+- Anda memahami eksposurnya.
 
-Check listening sockets:
+Periksa listening socket:
 
 ```bash
 ss -ltnp | grep 8787
@@ -1290,23 +1290,23 @@ ss -ltnp | grep 8787
 
 ---
 
-### `write_file` says writes are disabled
+### `write_file` bilang tulis nonaktif
 
-Enable:
+Aktifkan:
 
 ```text
 AGENT_ALLOW_WRITE=1
 ```
 
-and configure:
+dan konfigurasikan:
 
 ```text
 AGENT_MCP_TOKEN
 ```
 
-Restart after changing environment values.
+Restart setelah mengubah nilai environment.
 
-For systemd:
+Untuk systemd:
 
 ```bash
 sudo systemctl restart gpt-go-agent
@@ -1314,47 +1314,47 @@ sudo systemctl restart gpt-go-agent
 
 ---
 
-### Path rejected even though it looks inside the workspace
+### Path ditolak padahal kelihatannya di dalam workspace
 
-The server intentionally rejects path resolution that escapes through `..`, absolute paths, or symlinks.
+Server dengan sengaja menolak resolusi path yang keluar lewat `..`, path absolut, atau symlink.
 
-Inspect the path:
+Periksa path:
 
 ```bash
 readlink -f /var/lib/gpt-go-agent/workspace/path/to/item
 ```
 
-If it resolves outside `AGENT_WORKSPACE`, the rejection is expected.
+Jika resolve ke luar `AGENT_WORKSPACE`, penolakan itu memang seharusnya.
 
-Move/copy the required data into the workspace instead of weakening the root boundary.
+Pindahkan/salin data yang dibutuhkan ke dalam workspace, bukan melemahkan batas root.
 
 ---
 
-### `exec_command` says command is not allowlisted
+### `exec_command` bilang perintah tidak ada di allowlist
 
-Add the executable name to:
+Tambahkan nama executable ke:
 
 ```text
 AGENT_ALLOWED_COMMANDS
 ```
 
-but remember that this is only gate one.
+tapi ingat bahwa ini hanya gerbang satu.
 
-Example:
+Contoh:
 
 ```text
 AGENT_ALLOWED_COMMANDS=uptime,pwd,date
 ```
 
-Restart the service.
+Restart service.
 
 ---
 
-### Command is allowlisted but still says it is not permitted
+### Perintah di-allowlist tapi tetap bilang tidak diizinkan
 
-That means deterministic restricted policy rejected it.
+Artinya kebijakan terbatas deterministik menolaknya.
 
-This is expected for general execution primitives such as:
+Ini memang seharusnya untuk primitif eksekusi umum seperti:
 
 ```text
 python3
@@ -1366,25 +1366,25 @@ make
 curl
 ```
 
-Do not treat `AGENT_ALLOWED_COMMANDS` as a way to bypass policy.
+Jangan memperlakukan `AGENT_ALLOWED_COMMANDS` sebagai cara melewati kebijakan.
 
-If a new native capability is genuinely needed, implement a narrow validator for that command/subcommand in the deterministic policy and add tests.
-
----
-
-### Custom `cwd` is rejected
-
-Restricted MCP native execution intentionally runs from the workspace root.
-
-Use workspace-relative operations through the file tools instead.
-
-If a future command needs a subdirectory, add a narrowly validated server-side operation rather than reopening arbitrary `cwd` path handling.
+Jika kapabilitas native baru benar-benar dibutuhkan, implementasikan validator sempit untuk perintah/subcommand itu di kebijakan deterministik dan tambahkan test.
 
 ---
 
-### `/webhook` returns 404
+### `cwd` kustom ditolak
 
-Webhook mode is probably disabled.
+Eksekusi native MCP terbatas dengan sengaja berjalan dari root workspace.
+
+Gunakan operasi relatif-workspace lewat tool file.
+
+Jika perintah masa depan butuh subdirektori, tambahkan operasi server-side dengan validasi sempit daripada membuka kembali penanganan path `cwd` sembarang.
+
+---
+
+### `/webhook` mengembalikan 404
+
+Mode webhook kemungkinan nonaktif.
 
 Set:
 
@@ -1393,54 +1393,54 @@ AGENT_WEBHOOK_ENABLED=1
 AGENT_WEBHOOK_TOKEN=<secret>
 ```
 
-and restart.
+dan restart.
 
-When webhook mode is disabled, webhook routes are intentionally not mounted.
+Saat mode webhook nonaktif, route webhook dengan sengaja tidak di-mount.
 
 ---
 
-### Webhook returns 401
+### Webhook mengembalikan 401
 
-Verify:
+Verifikasi:
 
 ```text
 AGENT_WEBHOOK_TOKEN
 ```
 
-and send:
+dan kirim:
 
 ```http
-Authorization: Bearer YOUR_WEBHOOK_TOKEN
+Authorization: Bearer YOUR_W...OKEN
 ```
 
-The MCP token and webhook token are separate credentials.
+Token MCP dan token webhook adalah credential terpisah.
 
 ---
 
-### Webhook POST returns 409
+### Webhook POST mengembalikan 409
 
-You reused an `Idempotency-Key` with different intent/context content.
+Anda memakai ulang `Idempotency-Key` dengan konten intent/context berbeda.
 
-Use either:
+Gunakan salah satu:
 
-- the original request body for that key; or
-- a new idempotency key.
-
----
-
-### Webhook returns 429
-
-The request limiter has been exceeded.
-
-Respect the `Retry-After` header and retry later.
-
-If sustained traffic is expected, first evaluate worker capacity and storage scalability instead of simply raising the request limit.
+- body permintaan asli untuk key tersebut; atau
+- idempotency key baru.
 
 ---
 
-### Webhook returns 503 or jobs fail during Middleman evaluation
+### Webhook mengembalikan 429
 
-Check:
+Request limiter sudah terlewati.
+
+Hormati header `Retry-After` dan retry nanti.
+
+Jika traffic berkelanjutan diharapkan, evaluasi dulu kapasitas worker dan skalabilitas storage daripada sekadar menaikkan request limit.
+
+---
+
+### Webhook mengembalikan 503 atau job gagal selama evaluasi Middleman
+
+Periksa:
 
 ```text
 AGENT_MIDDLEMAN_URL
@@ -1448,41 +1448,41 @@ AGENT_MIDDLEMAN_KEY
 AGENT_MIDDLEMAN_MODEL
 ```
 
-Verify connectivity from the service host.
+Verifikasi konektivitas dari host service.
 
-Check logs:
+Periksa log:
 
 ```bash
 journalctl -u gpt-go-agent -n 200
 ```
 
-Also inspect `/metrics` for Middleman retry/circuit information when available.
+Periksa juga `/metrics` untuk informasi retry/circuit Middleman saat tersedia.
 
 ---
 
-### Codex job fails: executable not found
+### Job Codex gagal: executable not found
 
-Check:
+Periksa:
 
 ```text
 AGENT_CODEX_BIN
 ```
 
-Verify from the service environment:
+Verifikasi dari environment service:
 
 ```bash
 command -v codex
 ```
 
-For systemd deployments, remember that the service's `PATH` may differ from your interactive shell.
+Untuk deployment systemd, ingat bahwa `PATH` service dapat berbeda dari shell interaktif Anda.
 
-Use an explicit absolute executable path in `AGENT_CODEX_BIN` when necessary.
+Gunakan path executable absolut eksplisit di `AGENT_CODEX_BIN` saat diperlukan.
 
 ---
 
-### Codex can read but cannot modify files
+### Codex bisa baca tapi tidak bisa modifikasi file
 
-That is the default.
+Itu default-nya.
 
 Set:
 
@@ -1490,70 +1490,70 @@ Set:
 AGENT_CODEX_ALLOW_WRITE=1
 ```
 
-only if workspace mutation is intentionally required.
+hanya jika mutasi workspace memang sengaja dibutuhkan.
 
-Restart afterward.
+Restart setelah itu.
 
 ---
 
-### Job store fails to load
+### Job store gagal load
 
-Default location:
+Lokasi default:
 
 ```text
 /var/lib/gpt-go-agent/jobs/store.json
 ```
 
-Check:
+Periksa:
 
 ```bash
 ls -la /var/lib/gpt-go-agent/jobs/
 ```
 
-The service account must be able to write the directory.
+Service account harus bisa menulis ke direktori.
 
-If the primary is corrupt/missing, the loader automatically tries:
+Jika primary corrupt/hilang, loader otomatis coba:
 
 ```text
 store.json.bak
 ```
 
-If both primary and backup exist but are invalid, startup fails intentionally so corrupted state is not silently discarded.
+Jika keduanya ada tapi invalid, startup gagal dengan sengaja agar state rusak tidak dibuang diam-diam.
 
 ---
 
-### Permission denied under systemd
+### Permission denied di bawah systemd
 
-The service runs as:
+Service berjalan sebagai:
 
 ```text
 gptagent:gptagent
 ```
 
-and systemd only permits writes under:
+dan systemd hanya mengizinkan tulis di bawah:
 
 ```text
 /var/lib/gpt-go-agent
 ```
 
-Check ownership:
+Periksa ownership:
 
 ```bash
 sudo chown -R gptagent:gptagent /var/lib/gpt-go-agent
 sudo chmod 0700 /var/lib/gpt-go-agent
 ```
 
-Do not broadly relax `ProtectSystem` or filesystem permissions just to make one path work. Prefer moving writable agent state under the intended service directory.
+Jangan melonggarkan `ProtectSystem` atau permission filesystem secara luas hanya untuk membuat satu path jalan. Lebih baik pindahkan state agent yang writable ke direktori service yang dimaksud.
 
 ---
 
-### `/readyz` returns 503
+### `/readyz` mengembalikan 503
 
-In MCP-only mode this should normally be ready after startup.
+Dalam mode MCP-only seharusnya normal ready setelah startup.
 
-In webhook mode, verify Middleman URL/model configuration.
+Dalam mode webhook, verifikasi konfigurasi URL/model Middleman.
 
-Inspect:
+Periksa:
 
 ```bash
 curl -i http://127.0.0.1:8787/readyz
@@ -1562,91 +1562,91 @@ journalctl -u gpt-go-agent -n 100
 
 ---
 
-### `/metrics` is empty
+### `/metrics` kosong
 
-This is normal in MCP-only mode.
+Ini normal dalam mode MCP-only.
 
-Worker metrics are registered only when webhook mode is enabled.
+Worker metrics diregistrasi hanya ketika mode webhook diaktifkan.
 
 ---
 
-### Audit log is missing
+### Audit log tidak ada
 
-Check:
+Periksa:
 
 ```text
 AGENT_AUDIT_PATH
 ```
 
-and parent-directory permissions.
+dan permission direktori parent.
 
-Production example:
+Contoh produksi:
 
 ```text
 AGENT_AUDIT_PATH=/var/lib/gpt-go-agent/agent-audit.jsonl
 ```
 
-The service account must be able to create/write the file.
+Service account harus bisa membuat/menulis file.
 
 ---
 
-### Deployment script rolls back
+### Deployment script rollback
 
-`scripts/deploy.sh` rolls back if:
+`scripts/deploy.sh` rollback jika:
 
-- systemd fails to become active;
-- `/healthz` fails;
-- `/readyz` fails.
+- systemd gagal menjadi active;
+- `/healthz` gagal;
+- `/readyz` gagal.
 
-Inspect:
+Periksa:
 
 ```bash
 systemctl status gpt-go-agent
 journalctl -u gpt-go-agent -n 200
 ```
 
-Fix readiness/configuration before retrying deployment.
+Perbaiki readiness/konfigurasi sebelum retry deployment.
 
 ---
 
-## Operational recommendations
+## Rekomendasi operasional
 
-For a small private deployment:
+Untuk deployment privat kecil:
 
-1. keep `AGENT_LISTEN_ADDR=127.0.0.1:8787`;
-2. use a secure tunnel/private network for remote MCP access;
-3. configure a long random MCP token before enabling mutation or execution;
-4. keep `AGENT_ALLOW_WRITE=0` unless needed;
-5. keep `AGENT_ALLOW_COMMAND_EXEC=0` unless needed;
-6. use the minimal native allowlist required;
-7. keep webhook mode disabled unless you actually use it;
-8. use a separate webhook token from the MCP token;
-9. keep Codex read-only unless coding jobs must modify files;
-10. keep the workspace narrowly scoped;
-11. review the audit log;
-12. monitor `/readyz`, queue depth, failures, and disk usage;
-13. back up any job/audit state you care about.
+1. pertahankan `AGENT_LISTEN_ADDR=127.0.0.1:8787`;
+2. gunakan secure tunnel/private network untuk akses MCP jarak jauh;
+3. konfigurasikan token MCP random panjang sebelum mengaktifkan mutasi atau eksekusi;
+4. pertahankan `AGENT_ALLOW_WRITE=0` kecuali dibutuhkan;
+5. pertahankan `AGENT_ALLOW_COMMAND_EXEC=0` kecuali dibutuhkan;
+6. gunakan allowlist native minimal yang dibutuhkan;
+7. pertahankan mode webhook nonaktif kecuali benar-benar dipakai;
+8. gunakan token webhook terpisah dari token MCP;
+9. pertahankan Codex read-only kecuali job coding harus memodifikasi file;
+10. pertahankan workspace dengan scope sempit;
+11. periksa audit log;
+12. monitor `/readyz`, queue depth, kegagalan, dan penggunaan disk;
+13. backup state job/audit yang Anda pedulikan.
 
-For production exposure, also add:
+Untuk eksposur produksi, juga tambahkan:
 
-- TLS or a trusted secure tunnel;
-- firewall rules;
-- secret rotation;
-- log retention;
+- TLS atau secure tunnel tepercaya;
+- aturan firewall;
+- rotasi secret;
+- retensi log;
 - monitoring/alerts;
-- regular dependency and OS updates.
+- update dependency dan OS berkala.
 
 ---
 
-## Known architectural follow-ups
+## Tindak lanjut arsitektur yang diketahui
 
 ### Job persistence
 
-The current webhook store is a durable JSON snapshot store. It rewrites the retained job map on persistence updates.
+Webhook store saat ini adalah durable JSON snapshot store. Ia menulis ulang peta job yang dipertahankan pada pembaruan persistensi.
 
-This is intentionally simple and operationally lightweight, but it is not the right long-term backend for sustained high-volume job traffic.
+Ini sengaja sederhana dan ringan secara operasional, tapi bukan backend jangka panjang yang tepat untuk traffic job volume tinggi.
 
-The recommended future direction is:
+Arah masa depan yang direkomendasikan:
 
 ```text
 SQLite
@@ -1657,26 +1657,26 @@ SQLite
 + efficient retention deletes
 ```
 
-### MCP protocol implementation
+### Implementasi protokol MCP
 
-The MCP wire layer is currently hand-written and pinned to:
+Lapisan transport/protok ol MCP saat ini ditulis tangan dan dipin ke:
 
 ```text
 2025-06-18
 ```
 
-A future compatibility-focused change should migrate the transport/protocol layer to the official MCP Go SDK with explicit client compatibility tests.
+Perubahan masa depan yang fokus-kompatibel sebaiknya migrasikan lapisan transport/protok ol ke MCP Go SDK resmi dengan tes kompatibilitas klien eksplisit.
 
-That migration should remain separate from execution-policy changes so protocol behavior and security behavior can be reviewed independently.
+Migrasi itu sebaiknya tetap terpisah dari perubahan kebijakan eksekusi agar perilaku protokol dan perilaku keamanan dapat di-review secara independen.
 
-### Execution capabilities
+### Kapabilitas eksekusi
 
-The restricted command surface is intentionally small.
+Permukaan perintah terbatas sengaja kecil.
 
-If additional capabilities are needed, prefer adding **narrow typed tools or narrowly validated subcommands** rather than expanding toward arbitrary process execution.
+Jika kapabilitas tambahan dibutuhkan, lebih memilih menambah **tool bertipe sempit atau subcommand dengan validasi sempit** daripada memperluas ke arah eksekusi proses sembarang.
 
 ---
 
-## License / ownership
+## Lisensi / kepemilikan
 
-This repository is currently maintained as a private project. Add an explicit license before redistributing it publicly.
+Repositori ini saat ini dikelola sebagai proyek privat. Tambahkan lisensi eksplisit sebelum mendistribusikannya secara publik.
