@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dragovics/gpt-go-agent/internal/agent"
 	"github.com/dragovics/gpt-go-agent/internal/audit"
 	"github.com/dragovics/gpt-go-agent/internal/config"
 	"github.com/dragovics/gpt-go-agent/internal/mcp"
@@ -41,7 +40,6 @@ func main() {
 	cfg := config.Default()
 	cfg.Workspace = *workspace
 
-	a := agent.New(cfg.Version)
 	auditPath := getenv("AGENT_AUDIT_PATH", cfg.AuditPath)
 	auditLog := audit.New(auditPath)
 
@@ -58,7 +56,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	status := server.New(a)
+	status := server.New(cfg.Version)
 	handler := http.NewServeMux()
 	handler.Handle("/healthz", status.Handler())
 	handler.Handle("/readyz", status.Handler())

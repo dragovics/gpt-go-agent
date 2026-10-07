@@ -4,43 +4,47 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-
-	"github.com/dragovics/gpt-go-agent/internal/agent"
 )
 
 type Server struct {
-	Agent   *agent.Agent
+	Version string
 	Metrics func() map[string]int64
 	Ready   func() bool
 }
 
-func New(a *agent.Agent) *Server {
-	return &Server{Agent: a}
+func New(version string) *Server {
+	return &Server{Version: version}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("content-type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "version": s.Agent.Version})
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		ready := s.Ready == nil || s.Ready()
-		w.Header().Set("content-type", "application/json")
-		if !ready {
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"ready": ready})
-	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("content-type", "text/plain; version=0.0.4")
-		metrics := map[string]int64{}
-		if s.Metrics != nil {
-			metrics = s.Metrics()
-		}
-		for name, value := range metrics {
-			_, _ = fmt.Fprintf(w, "gpt_go_agent_%s %d\n", name, value)
-		}
-	})
+	mux.HandleFunc("/healthz", s.healthz)
+	mux.HandleFunc("/readyz", s.readyz)
+	mux.HandleFunc("/metrics", s.metrics)
 	return mux
+}
+
+func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "version": s.Version})
+}
+
+func (s *Server) readyz(w http.ResponseWriter, _ *http.Request) {
+	if s.Ready != nil && !s.Ready() {
+		http.Error(w, `{"ready":false}`, http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ready": true})
+}
+
+func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
+	if s.Metrics == nil {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	for k, v := range s.Metrics() {
+		fmt.Fprintf(w, "gpt_go_agent_%s %d\n", k, v)
+	}
 }
