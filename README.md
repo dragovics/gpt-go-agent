@@ -202,10 +202,12 @@ Perintah native tetap harus melewati kebijakan server-side deterministik sebelum
 | Fitur | Default | Catatan |
 |---|---|---|
 | Endpoint HTTP MCP | aktif | `POST /mcp` |
-| Listing file workspace | aktif | ter-root ke `AGENT_WORKSPACE` |
-| Baca file workspace | aktif | ter-root dan output terbatas |
-| Tulis file workspace | nonaktif | aktifkan dengan `AGENT_ALLOW_WRITE=1` |
-| Eksekusi native MCP | nonaktif | aktifkan dengan `AGENT_ALLOW_COMMAND_EXEC=1` |
+| Listing file workspace | aktif | ter-root ke `AGENT_WORKSPACE` (`list_dir`) |
+| Baca file workspace | aktif | ter-root dan output terbatas (`read_file`) |
+| Cari file & regex workspace | aktif | ter-root, regex walk efisien (`search_files`) |
+| Tulis file workspace | nonaktif | aktifkan dengan `AGENT_ALLOW_WRITE=1` (`write_file`) |
+| Patch file terarah | nonaktif | aktifkan dengan `AGENT_ALLOW_WRITE=1` (`patch_file`) |
+| Eksekusi native MCP | nonaktif | aktifkan dengan `AGENT_ALLOW_COMMAND_EXEC=1` (`exec_command`) |
 | Bearer token MCP | opsional untuk loopback read-only | wajib saat tulis/exec diaktifkan |
 | Kebijakan native terbatas | selalu diterapkan | independen dari executable allowlist |
 | Audit log | aktif | JSON Lines, mode 0600 |
@@ -371,7 +373,9 @@ pwd
 date
 uname
 id
-ls
+ls (dengan argumen path workspace & flag aman seperti -la, -lh, -1)
+git (subcommand inspeksi read-only: status, diff, log, show, branch, rev-parse)
+grep (pencarian teks ter-root di dalam workspace)
 ```
 
 Kebijakan dengan sengaja menolak primitif eksekusi umum seperti:
@@ -550,6 +554,42 @@ Input:
 ```
 
 Direktori parent dibuat di dalam workspace ter-root sesuai kebutuhan.
+
+### `search_files`
+
+Mencari teks atau pola regex secara cepat di seluruh workspace tanpa perlu membaca file satu per satu. Mengabaikan file biner dan direktori non-kode (`.git`, `node_modules`, `.cache`, `vendor`, dll).
+
+Input:
+
+```json
+{
+  "pattern": "func Run",
+  "path": "src",
+  "max_matches": 50
+}
+```
+
+### `patch_file`
+
+Melakukan perubahan kode terarah (*find-and-replace*) pada file tertentu tanpa menulis ulang seluruh file.
+
+Membutuhkan:
+
+```text
+AGENT_ALLOW_WRITE=1
+AGENT_MCP_TOKEN=<token>
+```
+
+Input:
+
+```json
+{
+  "path": "src/main.go",
+  "old_string": "println(\"old\")",
+  "new_string": "println(\"new\")",
+  "replace_all": false
+}
+```
 
 ### `exec_command`
 
@@ -1763,7 +1803,7 @@ Jika kapabilitas tambahan dibutuhkan, lebih memilih menambah **tool bertipe semp
 
 ## Lisensi / kepemilikan
 
-Repositori ini saat ini dikelola sebagai proyek privat. Tambahkan lisensi eksplisit sebelum mendistribusikannya secara publik.
+Didistribusikan di bawah lisensi open-source [MIT License](LICENSE).
 
 ---
 
