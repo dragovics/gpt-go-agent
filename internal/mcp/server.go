@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -166,6 +169,8 @@ func (s *Server) tools() []map[string]any {
 		{"name": "list_dir", "description": "List entries inside a workspace-relative directory.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}}},
 		{"name": "read_file", "description": "Read a UTF-8 text file inside the configured workspace.", "inputSchema": map[string]any{"type": "object", "required": []string{"path"}, "properties": map[string]any{"path": map[string]any{"type": "string"}}}},
 		{"name": "write_file", "description": "Write a UTF-8 text file inside the configured workspace. Requires write access.", "inputSchema": map[string]any{"type": "object", "required": []string{"path", "content"}, "properties": map[string]any{"path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}}}},
+		{"name": "search_files", "description": "Search text or regex pattern across workspace files.", "inputSchema": map[string]any{"type": "object", "required": []string{"pattern"}, "properties": map[string]any{"pattern": map[string]any{"type": "string"}, "path": map[string]any{"type": "string", "description": "Subdirectory to search in (defaults to workspace root)."}, "max_matches": map[string]any{"type": "integer", "description": "Maximum number of matches to return (default 50)."}}}},
+		{"name": "patch_file", "description": "Targeted find-and-replace edit in a workspace file. Requires write access.", "inputSchema": map[string]any{"type": "object", "required": []string{"path", "old_string", "new_string"}, "properties": map[string]any{"path": map[string]any{"type": "string"}, "old_string": map[string]any{"type": "string"}, "new_string": map[string]any{"type": "string"}, "replace_all": map[string]any{"type": "boolean", "description": "Replace all occurrences instead of requiring unique match (default false)."}}}},
 		{"name": "exec_command", "description": "Run a server-allowlisted command that also passes the restricted deterministic command policy. Execution always starts at the workspace root.", "inputSchema": map[string]any{"type": "object", "required": []string{"command"}, "properties": map[string]any{"command": map[string]any{"type": "string"}, "args": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "cwd": map[string]any{"type": "string", "description": "Only empty or '.' is accepted."}}}},
 	}
 }
@@ -175,6 +180,7 @@ func (s *Server) callTool(w http.ResponseWriter, id any, params map[string]any) 
 	args, _ := params["arguments"].(map[string]any)
 	var out string
 	var err error
+	target := stringArg(args, "path")
 	switch name {
 	case "list_dir":
 		out, err = s.listDir(args)
@@ -182,16 +188,17 @@ func (s *Server) callTool(w http.ResponseWriter, id any, params map[string]any) 
 		out, err = s.readFile(args)
 	case "write_file":
 		out, err = s.writeFile(args)
+	case "search_files":
+		target = stringArg(args, "pattern")
+		out, err = s.searchFiles(args)
+	case "patch_file":
+		out, err = s.patchFile(args)
 	case "exec_command":
+		target = stringArg(args, "command")
 		out, err = s.execCommand(context.Background(), args)
 	default:
 		writeRPCError(w, id, -32602, "unknown tool")
 		return
-	}
-
-	target := stringArg(args, "path")
-	if name == "exec_command" {
-		target = stringArg(args, "command")
 	}
 	if err != nil {
 		if s.audit != nil {
@@ -409,4 +416,172 @@ func stringArg(args map[string]any, key string) string {
 		return v
 	}
 	return ""
+}
+
+func (s *Server) patchFile(args map[string]any) (string, error) {
+	if !s.cfg.AllowWrite {
+		return "", errors.New("writes are disabled")
+	}
+	clean, err := cleanRelative(stringArg(args, "path"))
+	if err != nil {
+		return "", err
+	}
+	if clean == "." {
+		return "", errors.New("path must name a file")
+	}
+	oldStr, ok := args["old_string"].(string)
+	if !ok || oldStr == "" {
+		return "", errors.New("old_string must be a non-empty string")
+	}
+	newStr, ok := args["new_string"].(string)
+	if !ok {
+		return "", errors.New("new_string must be a string")
+	}
+	replaceAll, _ := args["replace_all"].(bool)
+
+	root, err := s.openRoot()
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+
+	data, err := fs.ReadFile(root.FS(), clean)
+	if err != nil {
+		return "", err
+	}
+	content := string(data)
+
+	count := strings.Count(content, oldStr)
+	if count == 0 {
+		return "", fmt.Errorf("old_string not found in %s", clean)
+	}
+	if !replaceAll && count > 1 {
+		return "", fmt.Errorf("old_string matched %d times in %s; provide more surrounding context or set replace_all=true", count, clean)
+	}
+
+	var updated string
+	if replaceAll {
+		updated = strings.ReplaceAll(content, oldStr, newStr)
+	} else {
+		updated = strings.Replace(content, oldStr, newStr, 1)
+	}
+
+	f, err := root.OpenFile(clean, os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write([]byte(updated)); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("successfully patched %s (%d occurrence(s) replaced)", clean, count), nil
+}
+
+func (s *Server) searchFiles(args map[string]any) (string, error) {
+	patternStr := stringArg(args, "pattern")
+	if patternStr == "" {
+		return "", errors.New("pattern is required")
+	}
+	re, err := regexp.Compile(patternStr)
+	if err != nil {
+		return "", fmt.Errorf("invalid regex pattern: %w", err)
+	}
+
+	cleanPath, err := cleanRelative(stringArg(args, "path"))
+	if err != nil {
+		return "", err
+	}
+
+	maxMatches := 50
+	if m, ok := args["max_matches"].(float64); ok && m > 0 {
+		maxMatches = int(m)
+		if maxMatches > 200 {
+			maxMatches = 200
+		}
+	}
+
+	root, err := s.openRoot()
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+
+	var b strings.Builder
+	matchCount := 0
+
+	skipDirs := map[string]bool{
+		".git":         true,
+		"node_modules": true,
+		".cache":       true,
+		"vendor":       true,
+		".next":        true,
+		"dist":         true,
+		"build":        true,
+	}
+
+	walkErr := fs.WalkDir(root.FS(), cleanPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if matchCount >= maxMatches || b.Len() >= s.cfg.MaxOutputBytes {
+			return fs.SkipAll
+		}
+
+		info, err := d.Info()
+		if err != nil || info.Size() > 1024*1024 {
+			return nil
+		}
+
+		data, err := fs.ReadFile(root.FS(), path)
+		if err != nil {
+			return nil
+		}
+		checkLen := len(data)
+		if checkLen > 512 {
+			checkLen = 512
+		}
+		if bytes.IndexByte(data[:checkLen], 0) >= 0 {
+			return nil
+		}
+
+		scanner := bufio.NewScanner(bytes.NewReader(data))
+		lineNum := 1
+		for scanner.Scan() {
+			line := scanner.Text()
+			if re.MatchString(line) {
+				fmt.Fprintf(&b, "%s:%d: %s\n", path, lineNum, strings.TrimRight(line, "\r\n"))
+				matchCount++
+				if matchCount >= maxMatches || b.Len() >= s.cfg.MaxOutputBytes {
+					return fs.SkipAll
+				}
+			}
+			lineNum++
+		}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, fs.SkipAll) {
+		return "", walkErr
+	}
+
+	res := b.String()
+	if len(res) > s.cfg.MaxOutputBytes {
+		res = res[:s.cfg.MaxOutputBytes]
+	}
+	if res == "" {
+		return "no matches found", nil
+	}
+	return res, nil
 }

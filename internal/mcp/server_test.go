@@ -148,3 +148,95 @@ func TestCustomExecCWDRejected(t *testing.T) {
 		t.Fatal("expected custom cwd rejection")
 	}
 }
+
+func TestPatchFile(t *testing.T) {
+	workspace := t.TempDir()
+	testFile := filepath.Join(workspace, "code.go")
+	if err := os.WriteFile(testFile, []byte("func hello() {\n\tprintln(\"old\")\n}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(Config{
+		Workspace:  workspace,
+		Token:      "secret",
+		AllowWrite: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Success patch
+	res, err := s.patchFile(map[string]any{
+		"path":       "code.go",
+		"old_string": "println(\"old\")",
+		"new_string": "println(\"new\")",
+	})
+	if err != nil {
+		t.Fatalf("unexpected patch error: %v", err)
+	}
+	if !strings.Contains(res, "successfully patched") {
+		t.Fatalf("unexpected result: %s", res)
+	}
+
+	data, _ := os.ReadFile(testFile)
+	if !strings.Contains(string(data), "println(\"new\")") {
+		t.Fatal("file content was not updated")
+	}
+
+	// 2. Old string not found error
+	_, err = s.patchFile(map[string]any{
+		"path":       "code.go",
+		"old_string": "missing",
+		"new_string": "foo",
+	})
+	if err == nil {
+		t.Fatal("expected error for missing string")
+	}
+
+	// 3. Traversal escape error
+	_, err = s.patchFile(map[string]any{
+		"path":       "../escape.go",
+		"old_string": "a",
+		"new_string": "b",
+	})
+	if err == nil {
+		t.Fatal("expected error for escaping workspace")
+	}
+}
+
+func TestSearchFiles(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte("package main\n\nfunc Run() int {\n\treturn 42\n}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "other.txt"), []byte("nothing here\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(Config{Workspace: workspace}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Search for Run
+	res, err := s.searchFiles(map[string]any{
+		"pattern": "func Run",
+	})
+	if err != nil {
+		t.Fatalf("unexpected search error: %v", err)
+	}
+	if !strings.Contains(res, "main.go:3: func Run() int {") {
+		t.Fatalf("expected match in main.go, got: %s", res)
+	}
+
+	// Search missing pattern
+	res, err = s.searchFiles(map[string]any{
+		"pattern": "NotFoundPattern",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res != "no matches found" {
+		t.Fatalf("expected 'no matches found', got: %s", res)
+	}
+}
